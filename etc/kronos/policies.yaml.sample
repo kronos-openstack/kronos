@@ -1,0 +1,84 @@
+# Kronos Policy Definitions
+# =========================
+#
+# Each policy defines a PromQL-driven scheduling rule scoped to a
+# Nova host aggregate. The engine evaluates these policies on a
+# configurable interval and (when not in dry-run mode) proposes
+# live migrations to rebalance workloads.
+#
+# See: https://github.com/kronos-openstack/kronos
+
+policies:
+  # --- Example: CPU spread across GPU aggregate ---
+  - name: gpu-cpu-spread
+    mode: spread
+    aggregate: gpu-aggregate
+    weight: 0.6
+    imbalance_query: |
+      avg by (host) (
+        rate(libvirt_domain_info_cpu_time_seconds_total[5m])
+        / on(host) group_left()
+          sum by (host) (libvirt_domain_info_virtual_cpus)
+      )
+    vm_profile_query: |
+      rate(libvirt_domain_info_cpu_time_seconds_total[5m])
+      / on(instance_name) group_left()
+        libvirt_domain_info_virtual_cpus
+    vm_profile_label: instance_name
+    vm_profile_label_type: nova_internal_name
+    vm_profile_fallback: flavor_vcpu_ratio
+    host_label: host
+    threshold: 0.15
+    cooldown: 10m
+    capacity_threshold: 0.85
+    max_migrations_per_cycle: 3
+
+  # --- Example: Memory spread across standard aggregate ---
+  - name: std-memory-spread
+    mode: spread
+    aggregate: standard-aggregate
+    weight: 0.4
+    imbalance_query: |
+      avg by (host) (
+        libvirt_domain_info_memory_usage_bytes
+        / libvirt_domain_info_maximum_memory_bytes
+      )
+    vm_profile_query: |
+      libvirt_domain_info_memory_usage_bytes
+      / libvirt_domain_info_maximum_memory_bytes
+    vm_profile_label: instance_name
+    vm_profile_label_type: nova_internal_name
+    vm_profile_fallback: skip
+    threshold: 0.20
+    cooldown: 15m
+    max_migrations_per_cycle: 5
+
+  # --- Example: Bin-pack storage aggregate ---
+  #- name: storage-bin-pack
+  #  mode: pack
+  #  aggregate: storage-aggregate
+  #  weight: 1.0
+  #  imbalance_query: |
+  #    1 - avg by (host) (
+  #      rate(libvirt_domain_info_cpu_time_seconds_total[5m])
+  #      / on(host) group_left()
+  #        sum by (host) (libvirt_domain_info_virtual_cpus)
+  #    )
+  #  capacity_query: |
+  #    avg by (host) (
+  #      rate(libvirt_domain_info_cpu_time_seconds_total[5m])
+  #      / on(host) group_left()
+  #        sum by (host) (libvirt_domain_info_virtual_cpus)
+  #    )
+  #  vm_profile_query: |
+  #    rate(libvirt_domain_info_cpu_time_seconds_total[5m])
+  #    / on(instance_name) group_left()
+  #      libvirt_domain_info_virtual_cpus
+  #  vm_profile_label: instance_name
+  #  vm_profile_label_type: nova_internal_name
+  #  vm_profile_fallback: flavor_vcpu_ratio
+  #  threshold: 0.10
+  #  cooldown: 30m
+  #  capacity_threshold: 0.80
+  #  bin_pack_drain_threshold: 0.20
+  #  max_migrations_per_cycle: 2
