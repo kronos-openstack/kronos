@@ -1,0 +1,11 @@
+# Invalid: missing required fields, duplicate names
+policies:
+  - name: dup-policy
+    mode: spread
+    aggregate: agg1
+    imbalance_query: "up"
+
+  - name: dup-policy
+    mode: spread
+    aggregate: agg2
+    imbalance_query: "up"
