@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kronos-openstack"
+dynamic = ["version"]
+description = "PromQL-driven VM placement engine for OpenStack"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: OpenStack",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "oslo.config>=9.0.0",
+    "oslo.log>=6.0.0",
+    "openstacksdk>=4.0",
+    "pydantic>=2.6,<3",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+    "tenacity>=8.2",
+    "pytimeparse2>=1.7",
+    "keystoneauth1>=5.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "responses>=0.25",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "tox>=4.15",
+]
+
+[project.scripts]
+kronos-engine = "kronos.cmd.engine:main"
+kronos-test-config = "kronos.cmd.test_config:main"
+
+[tool.setuptools-scm]
+
+[tool.setuptools.packages.find]
+include = ["kronos*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = [
+    "oslo_config.*",
+    "oslo_log.*",
+    "keystoneauth1.*",
+    "openstack.*",
+    "pytimeparse2.*",
+    "tenacity.*",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
