@@ -1,0 +1,80 @@
+[DEFAULT]
+# debug = false
+
+[engine]
+# Seconds between policy evaluation cycles.
+# evaluation_interval = 60
+
+# When true, log migration plans without executing them.
+# dry_run = true
+
+# Path to the policies YAML file.
+# policies_file = /etc/kronos/policies.yaml
+
+[prometheus]
+# Prometheus base URL (required).
+# url = http://prometheus:9090
+
+# HTTP request timeout in seconds.
+# timeout = 30
+
+# Maximum number of retries for failed queries.
+# max_retries = 3
+
+# Base backoff time in seconds between retries.
+# retry_backoff = 1.0
+
+# Maximum sample age in seconds before data is considered stale.
+# staleness_threshold = 300
+
+# Verify SSL certificates when connecting to Prometheus.
+# verify_ssl = true
+
+# Path to CA certificate bundle for Prometheus TLS.
+# ca_cert =
+
+# Bearer token for Prometheus authentication.
+# bearer_token =
+
+# Path to file containing bearer token.
+# bearer_token_file =
+
+[nova]
+# Authentication type (keystoneauth1 plugin).
+# auth_type = password
+
+# Keystone authentication URL.
+# auth_url = http://keystone:5000/v3
+
+# OpenStack project/tenant name.
+# project_name = service
+
+# Project domain name.
+# project_domain_name = Default
+
+# Username for authentication.
+# username = kronos
+
+# Password for authentication (secret).
+# password =
+
+# User domain name.
+# user_domain_name = Default
+
+# Service type for endpoint discovery.
+# service_type = compute
+
+# Region name for endpoint discovery.
+# region_name = RegionOne
+
+# Valid endpoint interfaces (comma-separated).
+# valid_interfaces = internal,public
+
+# Override endpoint URL (bypass service catalog).
+# endpoint_override =
+
+# Path to CA certificate bundle.
+# cafile =
+
+# Skip SSL verification (NOT recommended for production).
+# insecure = false
