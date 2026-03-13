@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from pytimeparse2 import parse as _pytimeparse
+import pytimeparse2
 
 
 def parse_duration(value: str | int | float | timedelta) -> timedelta:
@@ -23,7 +23,7 @@ def parse_duration(value: str | int | float | timedelta) -> timedelta:
     if isinstance(value, (int, float)):
         return timedelta(seconds=value)
 
-    seconds = _pytimeparse(value)
+    seconds = pytimeparse2.parse(value)
     if seconds is None:
         raise ValueError(f"Cannot parse duration string: {value!r}")
     return timedelta(seconds=seconds)
