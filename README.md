@@ -1,6 +1,6 @@
 # Kronos
 
-**PromQL-driven VM placement engine for OpenStack** — the open-source equivalent of VMware DRS.
+**PromQL-driven VM placement optimization engine for OpenStack**
 
 Kronos evaluates Prometheus metrics per Nova host aggregate and plans live migrations
 to balance (spread) or consolidate (pack) workloads. It is a pure planner: it decides
