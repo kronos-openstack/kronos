@@ -1,7 +1,7 @@
-# Kronos — OpenStack VM Placement Engine
+# Kronos — OpenStack VM Placement Optimization Engine
 
 ## Project Overview
-Kronos is a PromQL-driven VM placement engine for OpenStack, equivalent to VMware DRS.
+Kronos is a PromQL-driven VM placement optimization engine for OpenStack.
 It evaluates Prometheus metrics per host aggregate and plans live migrations to balance
 (or consolidate) workloads. Open-source, Apache 2.0, targeting OpenStack umbrella acceptance.
 
