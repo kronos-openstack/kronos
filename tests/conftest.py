@@ -66,7 +66,6 @@ def sample_pack_policy_dict() -> dict:
         "threshold": 0.10,
         "cooldown": "5m",
         "capacity_threshold": 0.80,
-        "bin_pack_drain_threshold": 0.20,
     }
 
 

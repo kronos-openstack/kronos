@@ -67,7 +67,6 @@ class TestPolicyConfig:
         assert policy.vm_profile_fallback == VmProfileFallback.SKIP
         assert policy.capacity_query is None
         assert policy.capacity_threshold == 0.80
-        assert policy.bin_pack_drain_threshold == 0.30
         assert policy.max_migrations_per_cycle == 3
         assert policy.min_sustained_minutes == 0
 
@@ -80,30 +79,6 @@ class TestPolicyConfig:
         sample_policy_dict["mode"] = "pack"
         with pytest.raises(ValidationError, match="capacity_query"):
             PolicyConfig(**sample_policy_dict)
-
-    def test_drain_must_be_below_capacity(self):
-        with pytest.raises(ValidationError, match="bin_pack_drain_threshold"):
-            PolicyConfig(
-                name="bad-thresholds",
-                mode="pack",
-                aggregate="agg",
-                imbalance_query="up",
-                capacity_query="cap",
-                capacity_threshold=0.50,
-                bin_pack_drain_threshold=0.60,
-            )
-
-    def test_drain_equal_to_capacity_rejected(self):
-        with pytest.raises(ValidationError, match="bin_pack_drain_threshold"):
-            PolicyConfig(
-                name="equal-thresholds",
-                mode="pack",
-                aggregate="agg",
-                imbalance_query="up",
-                capacity_query="cap",
-                capacity_threshold=0.50,
-                bin_pack_drain_threshold=0.50,
-            )
 
     def test_invalid_name_uppercase(self):
         with pytest.raises(ValidationError, match="name"):

@@ -77,8 +77,6 @@ policies:
   #  vm_profile_label: instance_name
   #  vm_profile_label_type: nova_internal_name
   #  vm_profile_fallback: flavor_vcpu_ratio
-  #  threshold: 0.10
   #  cooldown: 30m
   #  capacity_threshold: 0.80
-  #  bin_pack_drain_threshold: 0.20
   #  max_migrations_per_cycle: 2

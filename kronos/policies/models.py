@@ -6,8 +6,8 @@ import enum
 from datetime import timedelta
 from typing import Any, Self
 
-from pydantic import BaseModel, Field, field_validator, model_validator
 import pytimeparse2
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def parse_duration(value: str | int | float | timedelta) -> timedelta:
@@ -120,13 +120,7 @@ class PolicyConfig(BaseModel):
         default=0.80,
         ge=0.0,
         le=1.0,
-        description="Maximum utilization for bin-pack destination hosts.",
-    )
-    bin_pack_drain_threshold: float = Field(
-        default=0.30,
-        ge=0.0,
-        le=1.0,
-        description="Hosts below this utilization are drain candidates in 'pack' mode.",
+        description="Maximum host utilization ceiling for 'pack' mode destinations.",
     )
     max_migrations_per_cycle: int = Field(
         default=3,
@@ -155,14 +149,6 @@ class PolicyConfig(BaseModel):
             raise ValueError("'pack' mode requires a capacity_query.")
         return self
 
-    @model_validator(mode="after")
-    def _drain_below_capacity(self) -> Self:
-        if self.bin_pack_drain_threshold >= self.capacity_threshold:
-            raise ValueError(
-                f"bin_pack_drain_threshold ({self.bin_pack_drain_threshold}) "
-                f"must be lower than capacity_threshold ({self.capacity_threshold})."
-            )
-        return self
 
 
 class PoliciesConfig(BaseModel):
