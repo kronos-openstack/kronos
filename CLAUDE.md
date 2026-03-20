@@ -63,8 +63,8 @@ call `logging.getLogger(__name__)`.
 - `kronos-api` → `kronos.cmd.api:main` (M5+)
 
 ## Milestones
-- **M1** (current): Skeleton — oslo.config, clients, dry-run engine loop
-- **M2**: Scoring + planner — simulation-based migration planning, dry-run reports
+- **M1**: Skeleton — oslo.config, clients, dry-run engine loop
+- **M2** (current): VM profiling, simulation-based migration planning, constraint checking
 - **M3**: Queue + executor — oslo.messaging, migration lifecycle, retries
 - **M4**: HA — tooz locks, active-passive, distributed rate limiter
 - **M5**: API + persistence — REST API, policy CRUD, audit log

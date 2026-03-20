@@ -6,7 +6,7 @@ Policies define the PromQL-driven scheduling rules that the engine evaluates.
 
 ## Why Pydantic (not oslo.config) for policies
 Policies contain PromQL query strings, per-aggregate tuning, mode-specific fields
-(capacity_query for bin_pack), and cross-field validation (drain < capacity threshold).
+(capacity_query for pack mode), and cross-field validation (pack requires capacity_query).
 This is richer than oslo.config's flat key-value model. oslo.config handles daemon config;
 Pydantic handles the policy DSL.
 
@@ -25,7 +25,7 @@ Pydantic handles the policy DSL.
 - `vm_profile_fallback`: what to do when VM has no Prometheus data ("skip", "flavor_vcpu_ratio", "host_average")
 - `threshold`: imbalance threshold to trigger rebalancing
 - `cooldown`: minimum time between migrations for this policy (parsed from "10m", "1h", etc.)
-- `capacity_threshold`: max utilization for bin_pack destinations
+- `capacity_threshold`: max host utilization ceiling for pack mode (no host goes above this)
 - `max_migrations_per_cycle`: cap per evaluation cycle
 
 ## Adding New Policy Fields
