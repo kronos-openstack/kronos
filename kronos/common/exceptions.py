@@ -112,3 +112,22 @@ class ImbalanceDetectionError(PolicyEvaluationError):
     msg_fmt = (
         "Imbalance detection failed for policy '%(policy_name)s': %(reason)s"
     )
+
+
+# --- Planner ---
+
+class PlannerError(KronosException):
+    msg_fmt = "Planner error for policy '%(policy_name)s': %(reason)s"
+
+
+class NoMigrationCandidatesError(PlannerError):
+    msg_fmt = (
+        "No migration candidates found for policy '%(policy_name)s': %(reason)s"
+    )
+
+
+class ConstraintViolationError(PlannerError):
+    msg_fmt = (
+        "Constraint violation for instance '%(instance_id)s' "
+        "to host '%(host)s': %(reason)s"
+    )
