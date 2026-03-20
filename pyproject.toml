@@ -45,6 +45,8 @@ dev = [
 [project.scripts]
 kronos-engine = "kronos.cmd.engine:main"
 kronos-test-config = "kronos.cmd.test_config:main"
+kronos-record = "kronos.cmd.record:main"
+kronos-replay = "kronos.cmd.replay:main"
 
 [tool.setuptools-scm]
 

@@ -34,10 +34,12 @@ def _make_mock_hypervisor(
     memory_size=131072,
     memory_used=65536,
     running_vms=10,
+    hypervisor_type="QEMU",
 ):
     hv = MagicMock()
     hv.name = name
     hv.hypervisor_hostname = hostname
+    hv.hypervisor_type = hypervisor_type
     hv.state = state
     hv.status = status
     hv.vcpus = vcpus

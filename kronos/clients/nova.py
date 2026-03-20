@@ -126,10 +126,15 @@ class NovaClient:
     def get_aggregate_hosts(self, aggregate_name: str) -> list[str]:
         """Get hostnames in a specific aggregate.
 
-        :param aggregate_name: Name of the aggregate.
+        If ``aggregate_name`` is ``"_all"``, returns all compute host names
+        (useful for clusters with no aggregates defined).
+
+        :param aggregate_name: Name of the aggregate, or ``"_all"`` for all hosts.
         :returns: List of hostnames.
         :raises AggregateNotFound: If the aggregate does not exist.
         """
+        if aggregate_name == "_all":
+            return [h.name for h in self.list_compute_hosts()]
         agg = self.get_aggregate(aggregate_name)
         return agg.hosts
 
@@ -148,10 +153,12 @@ class NovaClient:
                 reason=f"Failed to list hypervisors: {exc}"
             ) from exc
 
+        # Only include VM hypervisors (QEMU/KVM), skip ironic bare-metal nodes
+        hypervisor_types = {"QEMU", "qemu", "KVM", "kvm"}
         hosts = [
             ComputeHost(
                 name=h.name,
-                hypervisor_hostname=h.hypervisor_hostname,
+                hypervisor_hostname=h.name,
                 state=h.state,
                 status=h.status,
                 vcpus=h.vcpus or 0,
@@ -161,6 +168,7 @@ class NovaClient:
                 running_vms=h.running_vms or 0,
             )
             for h in hypervisors
+            if (h.hypervisor_type or "") in hypervisor_types
         ]
 
         if aggregate_name:
@@ -180,7 +188,7 @@ class NovaClient:
                 self._conn.compute.servers(
                     details=True,
                     all_projects=True,
-                    host=host,
+                    compute_host=host,
                 )
             )
         except Exception as exc:
