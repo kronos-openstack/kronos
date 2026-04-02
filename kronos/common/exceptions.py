@@ -131,3 +131,29 @@ class ConstraintViolationError(PlannerError):
         "Constraint violation for instance '%(instance_id)s' "
         "to host '%(host)s': %(reason)s"
     )
+
+
+# --- Executor / Migration ---
+
+class MigrationError(KronosException):
+    msg_fmt = "Migration error for instance '%(instance_uuid)s': %(reason)s"
+
+
+class PreFlightError(MigrationError):
+    msg_fmt = (
+        "Pre-flight check failed for instance '%(instance_uuid)s': %(reason)s"
+    )
+
+
+class MigrationTimeout(MigrationError):
+    msg_fmt = (
+        "Migration timed out for instance '%(instance_uuid)s' after "
+        "%(timeout_seconds)s seconds."
+    )
+
+
+class MigrationFailed(MigrationError):
+    msg_fmt = (
+        "Migration failed for instance '%(instance_uuid)s' "
+        "from '%(from_host)s' to '%(to_host)s': %(reason)s"
+    )

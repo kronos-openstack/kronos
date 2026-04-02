@@ -81,6 +81,7 @@ def mock_engine():
         conf.engine.evaluation_interval = 10
         conf.engine.dry_run = True
         conf.engine.policies_file = "/etc/kronos/policies.yaml"
+        conf.engine.instance_cooldown = 900
 
         engine = EngineLoop(conf)
         engine._scorer = mock_scorer_cls.return_value
@@ -156,7 +157,7 @@ class TestRunCycle:
 class TestEvaluatePolicy:
     def test_balanced_skips_planner(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
-        result = mock_engine._evaluate_policy(_make_policy())
+        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
 
         assert result.migration_plan is None
         mock_engine._profiler.collect.assert_not_called()
@@ -164,7 +165,7 @@ class TestEvaluatePolicy:
 
     def test_skipped_skips_planner(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_policy_result(skipped=True)
-        result = mock_engine._evaluate_policy(_make_policy())
+        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
 
         assert result.migration_plan is None
         mock_engine._profiler.collect.assert_not_called()
@@ -176,7 +177,7 @@ class TestEvaluatePolicy:
             policy_name="test-policy", aggregate="test-agg",
         )
 
-        result = mock_engine._evaluate_policy(_make_policy())
+        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
 
         mock_engine._profiler.collect.assert_called_once()
         mock_engine._planner.plan.assert_called_once()
@@ -186,7 +187,7 @@ class TestEvaluatePolicy:
         mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
         mock_engine._profiler.collect.return_value = {}
 
-        result = mock_engine._evaluate_policy(_make_policy())
+        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
 
         mock_engine._planner.plan.assert_not_called()
         assert result.migration_plan is None

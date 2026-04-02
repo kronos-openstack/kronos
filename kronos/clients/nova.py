@@ -6,6 +6,7 @@ Authentication is configured via keystoneauth1 loading from the
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass, field
 
 import openstack
@@ -56,6 +57,30 @@ class HostAggregate:
     name: str
     hosts: list[str]
     metadata: dict[str, str]
+
+
+class MigrationStatus(enum.StrEnum):
+    """Nova live migration status values."""
+
+    QUEUED = "queued"
+    PREPARING = "preparing"
+    RUNNING = "running"
+    POST_MIGRATING = "post_migrating"
+    COMPLETED = "completed"
+    ERROR = "error"
+    FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            MigrationStatus.COMPLETED,
+            MigrationStatus.ERROR,
+            MigrationStatus.FAILED,
+        }
+
+    @property
+    def is_success(self) -> bool:
+        return self == MigrationStatus.COMPLETED
 
 
 class NovaClient:
@@ -233,3 +258,103 @@ class NovaClient:
             raise NovaClientError(
                 reason=f"Failed to list server groups: {exc}"
             ) from exc
+
+    # --- M3: Write operations ---
+
+    def get_instance_status(
+        self, instance_uuid: str,
+    ) -> tuple[str, str | None]:
+        """Get instance status and task_state for pre-flight checks.
+
+        :param instance_uuid: The instance UUID.
+        :returns: Tuple of (status, task_state). task_state is None when idle.
+        :raises NovaClientError: If the API call fails.
+        """
+        try:
+            server = self._conn.compute.get_server(instance_uuid)
+            return server.status, getattr(server, "task_state", None)
+        except Exception as exc:
+            raise NovaClientError(
+                reason=f"Failed to get instance {instance_uuid}: {exc}"
+            ) from exc
+
+    def get_instance_host(self, instance_uuid: str) -> str:
+        """Get the current compute host for an instance.
+
+        :param instance_uuid: The instance UUID.
+        :returns: Hostname the instance is running on.
+        :raises NovaClientError: If the API call fails.
+        """
+        try:
+            server = self._conn.compute.get_server(instance_uuid)
+            return getattr(server, "hypervisor_hostname", "") or ""
+        except Exception as exc:
+            raise NovaClientError(
+                reason=f"Failed to get instance {instance_uuid}: {exc}"
+            ) from exc
+
+    def live_migrate(
+        self,
+        instance_uuid: str,
+        dest_host: str,
+        block_migration: str = "auto",
+    ) -> None:
+        """Request a live migration via the Nova API.
+
+        :param instance_uuid: The instance to migrate.
+        :param dest_host: Destination compute host.
+        :param block_migration: "auto", "true", or "false".
+        :raises NovaClientError: If the API call fails.
+        """
+        try:
+            self._conn.compute.live_migrate_server(
+                instance_uuid,
+                host=dest_host,
+                block_migration=block_migration,
+            )
+            LOG.info(
+                "Live migration requested: %s -> %s",
+                instance_uuid,
+                dest_host,
+            )
+        except Exception as exc:
+            raise NovaClientError(
+                reason=f"Failed to request live migration for {instance_uuid}: {exc}"
+            ) from exc
+
+    def get_migration_status(
+        self, instance_uuid: str,
+    ) -> MigrationStatus | None:
+        """Get the status of any in-progress migration for an instance.
+
+        Uses the server migrations API (``GET /servers/{id}/migrations``)
+        which only returns **active** migrations — not historical ones.
+        Once a migration completes it disappears from this endpoint.
+
+        :param instance_uuid: The instance UUID.
+        :returns: MigrationStatus if an active migration exists, None otherwise.
+        :raises NovaClientError: If the API call fails.
+        """
+        try:
+            migrations = list(
+                self._conn.compute.server_migrations(instance_uuid),
+            )
+        except Exception as exc:
+            raise NovaClientError(
+                reason=f"Failed to get migrations for {instance_uuid}: {exc}"
+            ) from exc
+
+        if not migrations:
+            return None
+
+        latest = migrations[-1]
+        raw_status = str(getattr(latest, "status", "error")).lower()
+        try:
+            return MigrationStatus(raw_status)
+        except ValueError:
+            LOG.warning(
+                "Unknown migration status '%s' for %s, treating as error.",
+                raw_status,
+                instance_uuid,
+            )
+            return MigrationStatus.ERROR

@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "oslo.config>=9.0.0",
     "oslo.log>=6.0.0",
+    "oslo.messaging>=14.0.0",
     "openstacksdk>=4.0",
     "pydantic>=2.6,<3",
     "PyYAML>=6.0",
@@ -45,6 +46,7 @@ dev = [
 [project.scripts]
 kronos-engine = "kronos.cmd.engine:main"
 kronos-test-config = "kronos.cmd.test_config:main"
+kronos-executor = "kronos.cmd.executor:main"
 kronos-record = "kronos.cmd.record:main"
 kronos-replay = "kronos.cmd.replay:main"
 
@@ -69,6 +71,7 @@ plugins = ["pydantic.mypy"]
 module = [
     "oslo_config.*",
     "oslo_log.*",
+    "oslo_messaging.*",
     "keystoneauth1.*",
     "openstack.*",
     "pytimeparse2.*",

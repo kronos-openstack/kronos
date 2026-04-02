@@ -7,15 +7,15 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
 
 ## Architecture
 - **Engine** evaluates policies on a configurable interval (one engine per aggregate)
-- **Pure planner**: emits migration plans to RabbitMQ (M3+), never directly calls Nova migrate
-- **Executor** (M3+): dedicated oslo.messaging consumer that calls Nova live-migrate API
+- **Pure planner**: emits migration plans to per-aggregate RabbitMQ topics via oslo.messaging
+- **Executor**: dedicated oslo.messaging consumer per aggregate that calls Nova live-migrate API
 - **Per-aggregate**: each policy targets a Nova host aggregate, migrations stay within boundaries
 - **HA** (M4+): active-passive engines via tooz distributed locks
 
 ## OpenStack Conventions — MUST FOLLOW
 - **oslo.config** for all daemon configuration (`kronos.conf`)
 - **oslo.log** for logging
-- **oslo.messaging** for RPC/notifications (M3+)
+- **oslo.messaging** for notifications (engine → executor, executor → engine)
 - **Stevedore** for plugin discovery (M2+)
 - **openstacksdk** for Nova/Keystone API calls
 - Entry points in `pyproject.toml` under `[project.scripts]`
@@ -51,21 +51,21 @@ call `logging.getLogger(__name__)`.
 - `kronos/common/` — Shared utilities, exceptions, oslo.config registration
 - `kronos/policies/` — Pydantic models and loader for policy YAML
 - `kronos/clients/` — External service clients (Prometheus, Nova)
-- `kronos/engine/` — Control loop, scoring, planning (M1-M2)
-- `kronos/executor/` — Migration executor (M3+)
+- `kronos/engine/` — Control loop, scoring, planning, cooldown tracking
+- `kronos/executor/` — Migration executor (scheduler, runner, oslo.messaging consumer)
 - `kronos/api/` — REST API (M5+)
 - `kronos/coordination/` — HA and rate limiting (M4+)
 
 ## Entry Points
 - `kronos-engine` → `kronos.cmd.engine:main` — scheduling engine daemon
 - `kronos-test-config` → `kronos.cmd.test_config:main` — config validator
-- `kronos-executor` → `kronos.cmd.executor:main` (M3+)
+- `kronos-executor` → `kronos.cmd.executor:main` — migration executor daemon
 - `kronos-api` → `kronos.cmd.api:main` (M5+)
 
 ## Milestones
 - **M1**: Skeleton — oslo.config, clients, dry-run engine loop
-- **M2** (current): VM profiling, simulation-based migration planning, constraint checking
-- **M3**: Queue + executor — oslo.messaging, migration lifecycle, retries
+- **M2**: VM profiling, simulation-based migration planning, constraint checking
+- **M3** (current): Queue + executor — oslo.messaging, migration lifecycle, retries, cooldown
 - **M4**: HA — tooz locks, active-passive, distributed rate limiter
 - **M5**: API + persistence — REST API, policy CRUD, audit log
 - **M6**: Packaging — PyPI, systemd units, docs

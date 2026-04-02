@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from kronos.policies.models import PolicyMode
 
@@ -94,3 +95,74 @@ class CycleReport:
     policy_results: list[PolicyResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = True
+
+
+@dataclass
+class MigrationTask:
+    """A single migration to execute, published by the engine to the executor.
+
+    The engine creates one task per ``MigrationStep`` in a plan.  Tasks
+    within the same plan share a ``plan_id``.  The ``not_before`` field
+    staggers execution so the executor doesn't fire all migrations at once.
+    """
+
+    task_id: str
+    plan_id: str
+    policy_name: str
+    aggregate: str
+    instance_uuid: str
+    instance_name: str
+    from_host: str
+    to_host: str
+    weight: float
+    priority: int = 5
+    max_retries: int = 3
+    retry_count: int = 0
+    not_before: float = 0.0
+    created_at: str = ""
+
+    @staticmethod
+    def from_step(
+        step: MigrationStep,
+        plan_id: str,
+        policy_name: str,
+        aggregate: str,
+        not_before: float,
+        max_retries: int = 3,
+    ) -> MigrationTask:
+        """Create a MigrationTask from a MigrationStep."""
+        return MigrationTask(
+            task_id=str(uuid.uuid4()),
+            plan_id=plan_id,
+            policy_name=policy_name,
+            aggregate=aggregate,
+            instance_uuid=step.instance_uuid,
+            instance_name=step.instance_name,
+            from_host=step.from_host,
+            to_host=step.to_host,
+            weight=step.weight,
+            not_before=not_before,
+            max_retries=max_retries,
+            created_at=datetime.now(tz=UTC).isoformat(),
+        )
+
+
+@dataclass
+class MigrationResult:
+    """Outcome of a migration attempt, published by the executor.
+
+    Both active and passive engines listen for these to maintain
+    cooldown state.
+    """
+
+    task_id: str
+    plan_id: str
+    policy_name: str
+    instance_uuid: str
+    from_host: str
+    to_host: str
+    success: bool
+    error: str = ""
+    duration_seconds: float = 0.0
+    retry_count: int = 0
+    completed_at: str = ""

@@ -8,6 +8,53 @@ project_name, etc. under the ``[nova]`` config group.
 from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
 
+messaging_opts = [
+    cfg.StrOpt(
+        "transport_url",
+        help="oslo.messaging transport URL (e.g. rabbit://guest:guest@localhost:5672/).",
+    ),
+]
+
+executor_opts = [
+    cfg.IntOpt(
+        "max_concurrent_migrations",
+        default=2,
+        min=1,
+        max=10,
+        help="Maximum simultaneous live migrations per executor.",
+    ),
+    cfg.IntOpt(
+        "migration_timeout",
+        default=1800,
+        min=60,
+        help="Timeout in seconds for a single live migration.",
+    ),
+    cfg.IntOpt(
+        "migration_poll_interval",
+        default=10,
+        min=5,
+        help="Seconds between Nova migration status polls.",
+    ),
+    cfg.IntOpt(
+        "max_retries",
+        default=3,
+        min=0,
+        help="Maximum retry attempts for failed migrations.",
+    ),
+    cfg.FloatOpt(
+        "retry_backoff",
+        default=30.0,
+        min=1.0,
+        help="Base backoff in seconds between retries.",
+    ),
+    cfg.IntOpt(
+        "stagger_seconds",
+        default=30,
+        min=0,
+        help="Delay between consecutive migration starts.",
+    ),
+]
+
 engine_opts = [
     cfg.IntOpt(
         "evaluation_interval",
@@ -24,6 +71,11 @@ engine_opts = [
         "policies_file",
         default="/etc/kronos/policies.yaml",
         help="Path to the policies YAML file.",
+    ),
+    cfg.IntOpt(
+        "instance_cooldown",
+        default=900,
+        help="Seconds after a VM is included in a plan before it can be re-planned.",
     ),
 ]
 
@@ -77,6 +129,8 @@ prometheus_opts = [
     ),
 ]
 
+MESSAGING_GROUP = "messaging"
+EXECUTOR_GROUP = "executor"
 ENGINE_GROUP = "engine"
 PROMETHEUS_GROUP = "prometheus"
 NOVA_GROUP = "nova"
@@ -84,6 +138,8 @@ NOVA_GROUP = "nova"
 
 def register_opts(conf: cfg.ConfigOpts) -> None:
     """Register all Kronos configuration option groups."""
+    conf.register_opts(messaging_opts, group=MESSAGING_GROUP)
+    conf.register_opts(executor_opts, group=EXECUTOR_GROUP)
     conf.register_opts(engine_opts, group=ENGINE_GROUP)
     conf.register_opts(prometheus_opts, group=PROMETHEUS_GROUP)
 
@@ -97,6 +153,8 @@ def register_opts(conf: cfg.ConfigOpts) -> None:
 def list_opts() -> list[tuple[str, list[cfg.Opt]]]:
     """Return a list of (group, opts) for oslo.config sample generation."""
     return [
+        (MESSAGING_GROUP, messaging_opts),
+        (EXECUTOR_GROUP, executor_opts),
         (ENGINE_GROUP, engine_opts),
         (PROMETHEUS_GROUP, prometheus_opts),
         # keystoneauth1 opts are auto-registered; include for documentation

@@ -7,12 +7,13 @@ policies, detects imbalance, collects VM profiles, simulates moves,
 and produces migration plans. It never directly calls Nova migrate.
 
 ## Key Files
-- `types.py` — Dataclasses: HostScore, VmProfile, MigrationStep, MigrationPlan, PolicyResult, CycleReport
+- `types.py` — Dataclasses: HostScore, VmProfile, MigrationStep, MigrationPlan, MigrationTask, MigrationResult, PolicyResult, CycleReport
 - `scorer.py` — PolicyScorer: evaluates PromQL queries, produces per-host scores
 - `profiler.py` — VmProfiler: collects per-VM resource weights from Prometheus + Nova
 - `planner.py` — Planner: simulation-based migration planning (spread + pack)
 - `constraints.py` — ConstraintChecker: validates moves against server group anti-affinity
-- `loop.py` — EngineLoop: periodic evaluation cycle
+- `cooldown.py` — CooldownTracker: prevents oscillation via policy-level and instance-level cooldowns
+- `loop.py` — EngineLoop: periodic evaluation cycle, plan emission via oslo.messaging
 
 ## Data Flow
 ```
@@ -36,7 +37,10 @@ oslo.config → EngineLoop
                 │           ├── spread: greedy best-move-per-round
                 │           └── pack: First Fit Decreasing, coldest hosts first
                 │
-                └── log CycleReport + MigrationPlans
+                │
+                ├── if dry_run=true: log only
+                └── if dry_run=false: emit MigrationTasks to kronos.migrations.<agg>
+                    └── CooldownTracker.record_plan_emission()
 ```
 
 ## Score Normalization
@@ -72,8 +76,14 @@ The ConstraintChecker validates proposed moves against Nova server
 group anti-affinity rules. The cache is invalidated each engine cycle.
 Future: NUMA, CPU feature flags, flavor extra specs, consider other server groups policy in openstack https://docs.openstack.org/nova/2024.1/user/server-groups.html
 
+## Cooldown Tracking
+The CooldownTracker prevents oscillation and migration storms:
+- **Policy-level**: after emitting a plan, skip planning for that policy until `cooldown` expires
+- **Instance-level**: after including a VM in a plan, skip it for `instance_cooldown` seconds
+- Both active and passive engines listen on `kronos.results.<aggregate>` to maintain warm cooldown state
+- On failover, passive engine already knows recent migrations — no cold-start re-planning storm
+
 ## Future Extension Points
-- `loop.py` will publish MigrationPlan to oslo.messaging queue (M3)
 - `loop.py` will acquire tooz lock before entering loop (M4)
 
 ## Logging
@@ -85,7 +95,8 @@ LOG = logging.getLogger(__name__)
 
 ## EngineLoop Lifecycle
 1. Load oslo.config + policies YAML
-2. Initialize clients, profiler, constraints, planner
-3. Enter loop: score → profile → plan → log → sleep(evaluation_interval)
-4. Handle SIGTERM/SIGINT for graceful shutdown
-5. Constraint caches invalidated each cycle
+2. Initialize clients, profiler, constraints, planner, cooldown tracker
+3. If dry_run=false: initialize oslo.messaging transport + per-aggregate notifiers
+4. Enter loop: score → cooldown check → profile → plan → emit/log → sleep
+5. Handle SIGTERM/SIGINT for graceful shutdown
+6. Constraint caches invalidated each cycle
