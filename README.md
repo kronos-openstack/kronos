@@ -3,11 +3,15 @@
 **PromQL-driven VM placement optimization engine for OpenStack**
 
 Kronos evaluates Prometheus metrics per Nova host aggregate and plans live migrations
-to balance (spread) or consolidate (pack) workloads. When dry-run is disabled, it emits
-migration plans to RabbitMQ via oslo.messaging and a dedicated executor daemon carries
+to balance (spread) or consolidate (pack) workloads. Multiple policies on the same
+aggregate are combined into a single weighted score, so the planner can trade off
+memory and CPU (or any other PromQL-driven dimensions) simultaneously.
+
+When dry-run is disabled, the engine casts migration tasks to a per-aggregate RPC
+topic via oslo.messaging. A dedicated executor daemon consumes the tasks and carries
 them out through the Nova live-migrate API.
 
-> **Status:** Pre-alpha (Milestone 3 — queue-based executor). Not yet ready for production.
+> **Status:** Pre-alpha. Not yet ready for production.
 
 ## How It Works
 
@@ -20,13 +24,15 @@ them out through the Nova live-migrate API.
                     |                 |                 |
               +-----v-----------------v--+              |
               |       kronos-engine       |              |
-              |  per-policy evaluation:   |              |
-              |  query → score → profile  |              |
-              |  → plan migrations        |              |
+              |  for each aggregate:      |              |
+              |    score all policies     |              |
+              |    combined imbalance     |              |
+              |    profile all VMs        |              |
+              |    plan combined moves    |              |
               +------------+--------------+              |
                            |                             |
-                  MigrationTask (per step)               |
-                  via oslo.messaging ─────────────────►  |
+                  MigrationTask per step                 |
+                  RPC cast ───────────────────────────►  |
                                                          |
               +------------------------------------------v--+
               |            kronos-executor                   |
@@ -35,12 +41,20 @@ them out through the Nova live-migrate API.
               +---------------------------------------------+
 ```
 
-1. **Policies** define PromQL queries, thresholds, and scheduling modes per host aggregate.
-2. **Scorer** queries Prometheus, matches results to Nova hosts, normalizes scores, and detects imbalance.
-3. **Profiler** collects per-VM resource weights from Prometheus with fallback strategies for missing data.
-4. **Planner** simulates VM migrations to find an optimal rebalancing plan (greedy spread, FFD pack).
-5. **Cooldown Tracker** prevents oscillation by enforcing policy-level and instance-level cooldown periods.
-6. **Executor** consumes migration tasks from RabbitMQ, validates pre-flight state, calls Nova live-migrate, polls until completion, and verifies post-flight.
+1. **Policies** define PromQL queries, thresholds, and scheduling modes. All
+   policies in one file apply to every aggregate the engine manages.
+2. **Scorer** runs each policy's PromQL imbalance query against the aggregate's
+   host list, enforces the [0, 1] contract, and detects imbalance.
+3. **Profiler** collects per-VM resource weights *across all policies* in one
+   pass. Each VM carries a per-policy weight dict.
+4. **Combined scoring**: the planner simulates moves against every policy's
+   scores simultaneously, minimizing a weighted sum of imbalances (policy
+   `weight` values sum to 1.0).
+5. **Constraint checker** respects Nova server group hard and soft anti-affinity.
+6. **Cooldown tracker** prevents oscillation via aggregate-level and
+   instance-level cooldowns.
+7. **Executor** consumes migration tasks, validates pre-flight state, calls
+   Nova live-migrate, polls until completion, and verifies post-flight.
 
 ## Quick Start
 
@@ -84,6 +98,15 @@ evaluation_interval = 60
 dry_run = true
 policies_file = /etc/kronos/policies.yaml
 
+# Aggregate scope: at least one of `aggregates` or
+# `include_unassigned_hosts = true` must be set.
+aggregates = my-aggregate
+include_unassigned_hosts = false
+
+# Cooldowns (seconds)
+cooldown = 600
+instance_cooldown = 900
+
 [prometheus]
 url = http://prometheus:9090
 
@@ -108,16 +131,21 @@ stagger_seconds = 30
 
 **Minimal `policies.yaml`:**
 
+Aggregates live on the engine (`[engine] aggregates`), not the policy.
+Enabled policy weights must sum to 1.0. All policies in one file must
+share a mode (spread or pack).
+
 ```yaml
 policies:
   - name: cpu-spread
     mode: spread
-    aggregate: my-aggregate
+    weight: 0.3
     imbalance_query: |
       1 - avg by (nodename) (
         rate(node_cpu_seconds_total{mode="idle"}[5m])
-      ) * on(nodename) group_left()
-        node_uname_info
+        * on(instance) group_left(nodename)
+          node_uname_info
+      )
     host_label: nodename
     vm_profile_query: |
       rate(libvirt_domain_info_cpu_time_seconds_total[5m])
@@ -126,8 +154,29 @@ policies:
     vm_profile_label: instance_id
     vm_profile_label_type: nova_instance_uuid
     vm_profile_fallback: host_average
-    threshold: 0.15
-    cooldown: 10m
+    threshold: 0.05
+    max_migrations_per_cycle: 3
+
+  - name: memory-spread
+    mode: spread
+    weight: 0.7
+    imbalance_query: |
+      1 - avg by (nodename) (
+        node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes
+        * on(instance) group_left(nodename)
+          node_uname_info
+      )
+    host_label: nodename
+    vm_profile_query: |
+      libvirt_domain_memory_stats_rss_bytes
+      / on(instance) group_left()
+        label_replace(node_memory_MemTotal_bytes, "instance", "$1:9177", "instance", "(.+):.*")
+      * on(domain, instance) group_left(instance_id)
+        libvirt_domain_openstack_info
+    vm_profile_label: instance_id
+    vm_profile_label_type: nova_instance_uuid
+    vm_profile_fallback: skip
+    threshold: 0.10
     max_migrations_per_cycle: 3
 ```
 
@@ -142,6 +191,9 @@ kronos-engine --config-file /etc/kronos/kronos.conf
 
 # Start the executor for a specific aggregate (requires dry_run = false)
 kronos-executor --config-file /etc/kronos/kronos.conf --aggregate my-aggregate
+
+# Or for the unassigned-hosts pool (clusters without aggregates)
+kronos-executor --config-file /etc/kronos/kronos.conf --unassigned
 ```
 
 ### Record & Replay (offline testing)
@@ -150,33 +202,35 @@ Capture a snapshot of live OpenStack + Prometheus state and replay it locally:
 
 ```bash
 # Record
-kronos-record --config-file /etc/kronos/kronos.conf --output-dir /tmp/snapshot
+kronos-record --config-file /etc/kronos/kronos.conf /tmp/snapshot
 
 # Replay a single engine cycle against recorded data
-kronos-replay --config-file /etc/kronos/kronos.conf --snapshot-dir /tmp/snapshot
+kronos-replay --config-file /etc/kronos/kronos.conf /tmp/snapshot
 ```
 
 ## Policy Modes
 
 | Mode | Behavior |
 |------|----------|
-| `spread` | Balance load evenly across hosts — greedy simulation picks the best single move per round |
-| `pack` | Consolidate VMs onto fewer hosts — First Fit Decreasing, coldest hosts drained first |
+| `spread` | Balance load evenly across hosts — greedy combined-score simulation picks the best single move per round |
+| `pack` | Consolidate VMs onto fewer hosts — First Fit Decreasing on combined utilization |
 
-Each policy is scoped to a single Nova host aggregate. Migrations never cross aggregate boundaries.
+All policies in one file must share a mode. Migrations never cross
+aggregate boundaries.
 
 ## Architecture
 
 ### Engine (planner)
 
-One engine per aggregate evaluates policies on a configurable interval:
+One engine owns a set of aggregates (or the unassigned-hosts pool) and
+evaluates all enabled policies against each aggregate every cycle:
 
-1. **Score** — query Prometheus, normalize per-host scores 0.0–1.0, detect imbalance
-2. **Profile** — collect per-VM resource weights (Prometheus + fallback strategies)
-3. **Constrain** — validate moves against Nova server group anti-affinity rules
-4. **Plan** — simulate moves to minimize imbalance (spread) or maximize consolidation (pack)
-5. **Emit** — publish `MigrationTask` messages to `kronos.migrations.<aggregate>` via oslo.messaging
-6. **Cooldown** — enforce policy-level and instance-level cooldown to prevent oscillation
+1. **Score** — each policy runs its PromQL imbalance query; values must be in [0, 1]
+2. **Profile** — collect per-VM resource weights *across all policies* in one pass
+3. **Constrain** — respect Nova server group hard and soft anti-affinity
+4. **Plan** — simulate moves minimizing the weighted combined imbalance
+5. **Cast** — send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`
+6. **Cooldown** — enforce aggregate-level and instance-level cooldown
 
 ### Executor (migration runner)
 
@@ -187,15 +241,17 @@ One executor per aggregate consumes tasks from RabbitMQ:
 3. **Migrate** — call Nova live-migrate API
 4. **Poll** — check migration status until terminal state or timeout
 5. **Post-flight** — confirm instance landed on destination host and is ACTIVE
-6. **Retry** — on failure, re-publish with exponential backoff (up to `max_retries`)
-7. **Report** — publish `MigrationResult` to `kronos.results.<aggregate>`
+6. **Retry** — on failure, re-cast with exponential backoff (up to `max_retries`)
+7. **Report** — publish `MigrationResult` notification on `kronos.results.<aggregate>`
 
 ### Messaging topology
 
-| Topic | Publisher | Consumer |
-|-------|-----------|----------|
-| `kronos.migrations.<aggregate>` | Engine | Executor |
-| `kronos.results.<aggregate>` | Executor | Engine (active + passive, for cooldown tracking) |
+| Topic | Primitive | Publisher | Consumer |
+|-------|-----------|-----------|----------|
+| `kronos.migrations.<aggregate>` | RPC cast | Engine | Executor (competing consumers) |
+| `kronos.results.<aggregate>` | Notification | Executor | Engines (broadcast to active + passive for cooldown tracking) |
+
+The unassigned-hosts pool uses the reserved name `_unassigned_` in its topics.
 
 ## Project Layout
 

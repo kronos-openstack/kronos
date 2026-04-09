@@ -2,89 +2,181 @@
 
 ## Purpose
 Main control loop, policy evaluation, VM profiling, constraint checking,
-and migration planning. The engine is a pure planner — it evaluates
-policies, detects imbalance, collects VM profiles, simulates moves,
-and produces migration plans. It never directly calls Nova migrate.
+combined-scoring migration planning, and cooldown tracking. The engine is
+a pure planner — it evaluates policies, detects imbalance, simulates
+moves, produces migration plans, and casts them over RPC to the executor.
+It never calls Nova live-migrate directly.
 
 ## Key Files
-- `types.py` — Dataclasses: HostScore, VmProfile, MigrationStep, MigrationPlan, MigrationTask, MigrationResult, PolicyResult, CycleReport
-- `scorer.py` — PolicyScorer: evaluates PromQL queries, produces per-host scores
-- `profiler.py` — VmProfiler: collects per-VM resource weights from Prometheus + Nova
-- `planner.py` — Planner: simulation-based migration planning (spread + pack)
-- `constraints.py` — ConstraintChecker: validates moves against server group anti-affinity
-- `cooldown.py` — CooldownTracker: prevents oscillation via policy-level and instance-level cooldowns
-- `loop.py` — EngineLoop: periodic evaluation cycle, plan emission via oslo.messaging
+- `types.py` — Dataclasses: HostScore, VmProfile, MigrationStep, MigrationPlan, MigrationTask, MigrationResult, PolicyResult, AggregateResult, CycleReport
+- `scorer.py` — PolicyScorer: runs one policy's PromQL imbalance_query against a host list, normalises scores, enforces the [0, 1] contract
+- `profiler.py` — VmProfiler: collects per-VM resource weights across all policies for an aggregate in one pass
+- `planner.py` — Planner: combined-scoring simulation (spread greedy + pack First Fit Decreasing)
+- `constraints.py` — ConstraintChecker: validates moves against Nova server group anti-affinity (hard and soft)
+- `cooldown.py` — CooldownTracker: aggregate-level and instance-level cooldowns
+- `loop.py` — EngineLoop: periodic per-aggregate evaluation cycle, plan emission via RPC cast
+
+## Scope Resolution
+The engine operates on a fixed set of aggregates defined at startup via
+`[engine] aggregates` and `[engine] include_unassigned_hosts`. Each
+aggregate is evaluated independently every cycle. The unassigned-hosts
+pool is resolved by calling `NovaClient.get_hosts_in_aggregate(None)`.
 
 ## Data Flow
 ```
 oslo.config → EngineLoop
-                ├── loads policies (Pydantic)
-                ├── for each enabled policy:
-                │   ├── PolicyScorer.evaluate(policy)
-                │   │   ├── NovaClient.get_aggregate_hosts(aggregate)
-                │   │   ├── PrometheusClient.instant_query(imbalance_query)
-                │   │   ├── normalize scores
-                │   │   └── return PolicyResult
+                ├── loads policies (Pydantic) — all enabled policies apply to every aggregate
+                ├── resolves aggregate scope (aggregates list + unassigned pool)
+                │
+                ├── for each aggregate in scope:
+                │   ├── hosts = NovaClient.get_hosts_in_aggregate(aggregate)
                 │   │
-                │   └── if imbalance detected:
-                │       ├── VmProfiler.collect(policy, hosts, scores)
-                │       │   ├── NovaClient.list_instances_on_host(host)
-                │       │   ├── PrometheusClient.instant_query(vm_profile_query)
-                │       │   └── apply fallback for missing VMs
+                │   ├── for each enabled policy:
+                │   │   └── PolicyScorer.evaluate(policy, hosts) → PolicyResult
+                │   │       ├── PrometheusClient.instant_query(imbalance_query)
+                │   │       ├── filter to scope hosts, enforce [0, 1] range
+                │   │       ├── normalize, compute imbalance
+                │   │       └── return PolicyResult
+                │   │
+                │   ├── combined_imbalance = Σ (policy.weight × policy.imbalance)
+                │   │
+                │   └── if any policy.imbalance_detected:
+                │       ├── check cooldown (skip if aggregate is cooling)
                 │       │
-                │       └── Planner.plan(policy, host_scores, vm_profiles)
-                │           ├── ConstraintChecker (anti-affinity)
-                │           ├── spread: greedy best-move-per-round
-                │           └── pack: First Fit Decreasing, coldest hosts first
+                │       ├── VmProfiler.collect(policies, hosts, host_scores_by_policy)
+                │       │   ├── NovaClient.list_instances_on_host(host)
+                │       │   ├── PrometheusClient.instant_query(vm_profile_query)  — one per policy
+                │       │   └── VmProfile.weights[policy_name] for every policy
+                │       │
+                │       ├── Planner.plan(aggregate, policies, policy_results, vm_profiles)
+                │       │   ├── ConstraintChecker (anti-affinity + soft-anti-affinity)
+                │       │   ├── spread: greedy best-move-per-round minimising combined imbalance
+                │       │   └── pack: First Fit Decreasing, combined utilization for ordering
+                │       │
+                │       └── if not dry_run and plan has steps:
+                │           ├── for each step: RPCClient.cast('execute_migration', task)
+                │           └── CooldownTracker.record_plan_emission(aggregate, instance_uuids)
                 │
-                │
-                ├── if dry_run=true: log only
-                └── if dry_run=false: emit MigrationTasks to kronos.migrations.<agg>
-                    └── CooldownTracker.record_plan_emission()
+                └── log CycleReport (aggregate results, per-policy imbalances, plans)
 ```
 
+## Combined Scoring
+
+When multiple policies share the same aggregate, their imbalance values
+are combined into a single weighted score:
+
+```
+combined_imbalance = Σ (policy.weight × policy.imbalance)
+```
+
+Constraints on the PoliciesConfig (enforced at load time):
+- Enabled policy `weight` values sum to 1.0
+- All policies in a file share the same `mode` (spread or pack, not both)
+- Each `imbalance_query` must return values in [0, 1] — enforced at
+  runtime by the scorer; a policy returning out-of-range values is
+  skipped for that cycle
+
+### Simulation in the planner
+
+Each VM carries per-policy weights:
+
+```python
+VmProfile.weights: dict[str, float]   # {policy_name: weight}
+```
+
+When simulating a move, the planner applies the weight subtraction and
+addition **per policy** — a single move affects every policy's scores.
+
+### Move acceptance rule
+
+A candidate move is rejected if it would **worsen** any individual
+policy's imbalance **and** the policy's new imbalance is above its own
+threshold. This allows the planner to make trade-offs between dimensions
+(e.g. a small CPU regression to fix a large memory problem) while
+preventing:
+
+- pushing a previously-OK policy into violation
+- making an already-violating policy even worse
+
+### Stopping criterion
+
+Greedy spread stops when every individual policy's imbalance is at or
+below its threshold, or when `max_migrations_per_cycle` is reached, or
+when no improving move exists.
+
 ## Score Normalization
-Raw Prometheus values are normalized 0.0-1.0 within each aggregate using min-max.
-Imbalance is detected when: `(max_score - min_score) > threshold`
+Raw per-host Prometheus values are normalised 0.0-1.0 within each
+aggregate using min-max for logging purposes. The planner uses raw
+values (already in [0, 1]) for its combined score math.
 
 ## Planner Algorithms
 
-### Spread (greedy simulation)
-Each round: try every (source, vm, dest) combination, pick the single
-move that reduces imbalance the most. Apply it to simulated state, repeat
-up to `max_migrations_per_cycle`. Stop early if imbalance drops below threshold.
+### Spread (greedy combined-score simulation)
+Each round: try every (source, vm, dest) combination, compute the new
+combined imbalance, reject any move that worsens a policy past its
+threshold, pick the move with the largest combined improvement. Repeat
+until all policies are happy, `max_migrations_per_cycle` is hit, or no
+improving move exists.
 
-### Pack (First Fit Decreasing)
-Goal: consolidate VMs into the fewest hosts possible.
-1. Sort hosts coldest-first (drain order).
-2. For each host, sort its VMs biggest-first.
-3. For each VM, find the fullest non-draining host where
-   `score + vm.weight <= capacity_threshold`.
-4. Track draining hosts so VMs are never moved *to* them.
-5. Stop at `max_migrations_per_cycle`.
+### Pack (First Fit Decreasing on combined score)
+1. Sort hosts by combined weighted score ascending (coldest first = drain order)
+2. For each drain host, sort its VMs by combined weighted weight descending (biggest first)
+3. For each VM, find the fullest non-draining host where every policy's
+   projected score stays below that policy's `capacity_threshold`
+4. Track draining hosts so VMs are never moved *to* them
+5. Stop at `max_migrations_per_cycle`
 
 ## VM Profiling
-The VmProfiler queries `vm_profile_query` from Prometheus and maps
-labels back to Nova instances via `vm_profile_label_type`. Three
-fallback strategies for VMs without Prometheus data:
-- `skip` — exclude from planning (safest)
-- `flavor_vcpu_ratio` — estimate from host score and vCPU count
-- `host_average` — assume equal share of host's score
+The VmProfiler runs once per aggregate and builds a
+`dict[instance_uuid → VmProfile]` where each profile carries per-policy
+weights. For every instance × policy pair:
+
+1. Query Prometheus with that policy's `vm_profile_query`
+2. Map the label value to a Nova instance via `vm_profile_label_type`
+3. If the query has no data for that instance, apply the policy's fallback:
+   - `skip` — drop the VM from the whole combined profile (safest, default)
+   - `flavor_vcpu_ratio` — estimate from host score and vCPU count
+   - `host_average` — assume equal share of host's score
+
+A VM is excluded from planning entirely if any policy with `skip`
+fallback has no data for it.
 
 ## Constraint Checking
-The ConstraintChecker validates proposed moves against Nova server
-group anti-affinity rules. The cache is invalidated each engine cycle.
-Future: NUMA, CPU feature flags, flavor extra specs, consider other server groups policy in openstack https://docs.openstack.org/nova/2024.1/user/server-groups.html
+The ConstraintChecker reads Nova server groups across all projects and
+treats **both** `anti-affinity` and `soft-anti-affinity` as move-blocking
+(soft anti-affinity is best-effort at Nova placement time; Kronos
+respects the hint at migration time so it never deliberately collapses a
+previously-spread group).
+
+The cache is invalidated each engine cycle.
+
+Future: NUMA, CPU feature flags, flavor extra specs, other Nova server
+group policies — https://docs.openstack.org/nova/latest/user/server-groups.html
 
 ## Cooldown Tracking
 The CooldownTracker prevents oscillation and migration storms:
-- **Policy-level**: after emitting a plan, skip planning for that policy until `cooldown` expires
-- **Instance-level**: after including a VM in a plan, skip it for `instance_cooldown` seconds
-- Both active and passive engines listen on `kronos.results.<aggregate>` to maintain warm cooldown state
-- On failover, passive engine already knows recent migrations — no cold-start re-planning storm
 
-## Future Extension Points
-- `loop.py` will acquire tooz lock before entering loop (M4)
+- **Aggregate-level**: after emitting a plan for an aggregate, skip
+  planning for the same aggregate until `engine.cooldown` expires.
+  Global across all policies — combined scoring means one plan covers
+  all policies for an aggregate per cycle.
+- **Instance-level**: after including a VM in a plan, skip it for
+  `engine.instance_cooldown` seconds. Prevents a VM bouncing between
+  hosts via different migrations.
+
+Active and passive engines both maintain a tracker. The passive engine
+listens on `kronos.results.<aggregate>` and updates its own cooldown
+state from `migration.completed` / `migration.failed` notifications, so
+it has warm state on failover.
+
+## EngineLoop Lifecycle
+1. Load oslo.config + policies YAML
+2. Resolve aggregate scope from `[engine] aggregates` and `include_unassigned_hosts`
+3. Initialise Prometheus client, Nova client, scorer, profiler, constraints, planner, cooldown
+4. If `dry_run=false`: create RPC transport and per-aggregate RPC clients
+5. Enter loop: for each aggregate → score → cooldown check → profile → plan → cast → log
+6. Handle SIGTERM/SIGINT for graceful shutdown
+7. Constraint cache invalidated each cycle
 
 ## Logging
 Use oslo.log, never stdlib logging:
@@ -92,11 +184,3 @@ Use oslo.log, never stdlib logging:
 from oslo_log import log as logging
 LOG = logging.getLogger(__name__)
 ```
-
-## EngineLoop Lifecycle
-1. Load oslo.config + policies YAML
-2. Initialize clients, profiler, constraints, planner, cooldown tracker
-3. If dry_run=false: initialize oslo.messaging transport + per-aggregate notifiers
-4. Enter loop: score → cooldown check → profile → plan → emit/log → sleep
-5. Handle SIGTERM/SIGINT for graceful shutdown
-6. Constraint caches invalidated each cycle

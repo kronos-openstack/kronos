@@ -23,8 +23,21 @@ Wrappers for external services: Prometheus HTTP API and Nova (OpenStack).
 - Auth configured via `[nova]` config group: auth_type, auth_url, username, password, etc.
 - Uses `ks_loading.load_auth_from_conf_options()` + `load_session_from_conf_options()`
 - Returns dataclasses, not raw openstacksdk objects
-- Key types: `ComputeHost`, `Instance`, `HostAggregate`
-- Read-only in M1 — live-migrate calls added in M3
+- Key types: `ComputeHost`, `Instance`, `HostAggregate`, `MigrationStatus`
+- Read operations: `list_aggregates()`, `get_aggregate()`, `list_compute_hosts()`, `list_instances_on_host()`, `list_server_groups()`
+- Aggregate resolution: `get_hosts_in_aggregate(name: str | None)`. Pass
+  `None` to get hypervisors that are not members of any aggregate (the
+  "unassigned pool"). Only QEMU/KVM hypervisors are returned; ironic
+  bare-metal nodes are filtered out.
+- Write operations: `live_migrate()`, `get_instance_status()`,
+  `get_instance_host()`, `get_migration_status()`
+- **Server group compatibility**: the client reads both the legacy
+  `policy` (singular string) and modern `policies` (list) attributes
+  from openstacksdk and merges them into a single `policies` list.
+  Older Nova deployments populate only the singular field
+- Server groups are listed across **all projects**
+  (`all_projects=True`) so the constraint checker sees every group the
+  cluster cares about
 
 ## Testing
 - Prometheus: `responses` library to mock HTTP at transport level
@@ -43,4 +56,4 @@ LOG = logging.getLogger(__name__)
 - All exceptions inherit from KronosException (see common/exceptions.py)
 - Exceptions use the msg_fmt pattern with %(placeholder)s formatting
 - Retry logic lives in the client, not the caller
-- No caching in M1 (revisit if Nova API becomes a bottleneck)
+- No caching in the clients themselves (constraint checker caches server groups once per cycle)
