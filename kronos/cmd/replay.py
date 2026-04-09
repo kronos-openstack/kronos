@@ -1,8 +1,8 @@
 """Entry point for ``kronos-replay``: run the engine against recorded data.
 
-Loads a snapshot directory produced by ``kronos-record`` and runs a
-single engine evaluation cycle against it.  Nova and Prometheus clients
-are replaced with replay stubs that serve data from the snapshot files.
+Loads a snapshot directory produced by ``kronos-record`` and runs one
+combined-scoring evaluation per aggregate offline.  Nova and Prometheus
+clients are replaced with replay stubs backed by the snapshot files.
 """
 
 from __future__ import annotations
@@ -18,13 +18,14 @@ from oslo_log import log as logging
 from kronos.clients.nova import Instance
 from kronos.clients.prometheus import PrometheusHealth, QueryResult
 from kronos.common.config import register_opts
+from kronos.common.exceptions import AggregateNotFound
+from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.scorer import PolicyScorer
-from kronos.engine.types import CycleReport, MigrationPlan
+from kronos.engine.types import MigrationPlan
 from kronos.policies.loader import load_policies
-from kronos.policies.models import PolicyConfig
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
@@ -45,11 +46,13 @@ class ReplayNovaClient:
             (nova_dir / "server_groups.json").read_text(),
         )
 
-    def get_aggregate_hosts(self, aggregate_name: str) -> list[str]:
-        hosts = self._aggregates.get(aggregate_name)
+    def get_hosts_in_aggregate(
+        self, aggregate_name: str | None,
+    ) -> list[str]:
+        key = aggregate_name if aggregate_name is not None else UNASSIGNED_TOPIC_MARKER
+        hosts = self._aggregates.get(key)
         if hosts is None:
-            from kronos.common.exceptions import AggregateNotFound
-            raise AggregateNotFound(aggregate=aggregate_name)
+            raise AggregateNotFound(aggregate=key)
         return hosts
 
     def list_instances_on_host(self, host: str) -> list[Instance]:
@@ -87,12 +90,7 @@ class ReplayPrometheusClient:
         label_key: str = "host",
         expected_labels: set[str] | None = None,
     ) -> QueryResult:
-        """Look up a recorded query result by matching files.
-
-        The recorder writes one file per (policy, query_type) pair.
-        We match by scanning all files for the one whose ``query``
-        field matches the requested query string.
-        """
+        """Look up a recorded query result by matching the query string."""
         for path in sorted(self._prom_dir.glob("*.json")):
             data = json.loads(path.read_text())
             if data.get("query") == query:
@@ -124,118 +122,106 @@ class ReplayPrometheusClient:
         )
 
 
-def _run_replay(
-    snapshot_dir: Path,
-    policies_file: str,
-) -> int:
+def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
     """Run a single engine cycle against snapshot data."""
     nova = ReplayNovaClient(snapshot_dir)
     prometheus = ReplayPrometheusClient(snapshot_dir)
 
-    scorer = PolicyScorer(prometheus, nova)  # type: ignore[arg-type]
+    scorer = PolicyScorer(prometheus)  # type: ignore[arg-type]
     profiler = VmProfiler(prometheus, nova)  # type: ignore[arg-type]
     constraints = ConstraintChecker(nova)  # type: ignore[arg-type]
     planner = Planner(constraints)
 
     policies = load_policies(policies_file)
-    started_at = datetime.now(tz=UTC)
+    enabled = [p for p in policies.policies if p.enabled]
 
-    report = CycleReport(
-        cycle_number=1,
-        started_at=started_at,
-        completed_at=started_at,
-        dry_run=True,
-    )
+    # Aggregates to iterate: mirror the snapshot's keys.
+    aggregates: list[str | None] = []
+    for key in nova._aggregates:
+        aggregates.append(None if key == UNASSIGNED_TOPIC_MARKER else key)
 
-    for policy in policies.policies:
-        if not policy.enabled:
+    for aggregate in aggregates:
+        name = aggregate if aggregate is not None else "<unassigned>"
+        LOG.info("=== Aggregate: %s ===", name)
+
+        hosts = nova.get_hosts_in_aggregate(aggregate)
+        if not hosts:
+            LOG.info("  No hosts recorded, skipping.")
             continue
 
-        LOG.info("=== Policy: %s (mode=%s) ===", policy.name, policy.mode.value)
+        policy_results = [scorer.evaluate(p, hosts) for p in enabled]
 
-        try:
-            result = scorer.evaluate(policy)
-        except Exception as exc:
-            LOG.error("Scoring failed: %s", exc)
-            report.errors.append(f"{policy.name}: {exc}")
-            continue
-
-        if result.skipped:
-            LOG.info("  SKIPPED: %s", result.skip_reason)
-            report.policy_results.append(result)
-            continue
-
-        LOG.info(
-            "  Imbalance: %.3f (threshold=%.3f, detected=%s)",
-            result.imbalance,
-            policy.threshold,
-            result.imbalance_detected,
-        )
-        for hs in result.host_scores:
+        combined_imbalance = 0.0
+        any_detected = False
+        for policy, pr in zip(enabled, policy_results, strict=True):
+            if pr.skipped:
+                LOG.info("  [SKIP] %s: %s", pr.policy_name, pr.skip_reason)
+                continue
+            combined_imbalance += policy.weight * pr.imbalance
+            if pr.imbalance_detected:
+                any_detected = True
+            marker = "⚠" if pr.imbalance_detected else " "
             LOG.info(
-                "    %s: raw=%.4f normalized=%.3f",
-                hs.host,
-                hs.raw_score,
-                hs.normalized_score,
+                "  %s %s: imbalance=%.3f (threshold=%.3f)",
+                marker, pr.policy_name, pr.imbalance, policy.threshold,
             )
 
-        if result.imbalance_detected:
-            raw_scores = {hs.host: hs.raw_score for hs in result.host_scores}
-            aggregate_hosts = list(raw_scores.keys())
+        LOG.info("  Combined imbalance: %.3f", combined_imbalance)
 
-            vm_profiles = profiler.collect(
-                policy=policy,
-                aggregate_hosts=aggregate_hosts,
-                host_scores=raw_scores,
-            )
-            result.vm_profiles = vm_profiles
+        if not any_detected:
+            continue
 
-            if vm_profiles:
-                plan = planner.plan(
-                    policy=policy,
-                    host_scores=result.host_scores,
-                    vm_profiles=vm_profiles,
-                )
-                result.migration_plan = plan
-                _log_plan(policy, plan)
-            else:
-                LOG.info("  No VM profiles collected — cannot plan.")
+        active = [
+            (p, pr) for p, pr in zip(enabled, policy_results, strict=True)
+            if not pr.skipped
+        ]
+        active_policies = [p for p, _ in active]
+        active_results = [pr for _, pr in active]
+        host_scores_by_policy = {
+            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
+            for p, pr in active
+        }
 
-        report.policy_results.append(result)
+        vm_profiles = profiler.collect(
+            policies=active_policies,
+            hosts=hosts,
+            host_scores_by_policy=host_scores_by_policy,
+        )
 
-    report.completed_at = datetime.now(tz=UTC)
-    duration = (report.completed_at - report.started_at).total_seconds()
+        if not vm_profiles:
+            LOG.info("  No VM profiles collected — cannot plan.")
+            continue
 
-    LOG.info(
-        "=== Replay complete: %d policies, %d errors, %.1fs ===",
-        len(report.policy_results),
-        len(report.errors),
-        duration,
-    )
+        plan = planner.plan(
+            aggregate=name,
+            policies=active_policies,
+            policy_results=active_results,
+            vm_profiles=vm_profiles,
+        )
+        _log_plan(plan)
+
     return 0
 
 
-def _log_plan(policy: PolicyConfig, plan: MigrationPlan) -> None:
-    """Log a migration plan in detail."""
+def _log_plan(plan: MigrationPlan) -> None:
     if not plan.steps:
         LOG.info("  No migrations proposed.")
         return
 
     LOG.info(
-        "  Migration plan: %d steps, imbalance %.3f -> %.3f",
+        "  Migration plan: %d steps, combined %.3f -> %.3f",
         plan.migration_count,
         plan.initial_imbalance,
         plan.projected_imbalance,
     )
     for i, step in enumerate(plan.steps, 1):
         LOG.info(
-            "    [%d] %s (%s): %s -> %s (weight=%.4f, improvement=%.4f)",
+            "    [%d] %s (%s): %s -> %s (improvement=%.4f)",
             i,
             step.instance_name,
             step.instance_uuid[:8],
             step.from_host,
             step.to_host,
-            step.weight,
             step.improvement,
         )
 

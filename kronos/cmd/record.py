@@ -29,32 +29,28 @@ LOG = logging.getLogger(__name__)
 
 def _record_nova(
     nova: NovaClient,
-    policies: PoliciesConfig,
+    aggregate_names: list[str | None],
     snapshot_dir: Path,
 ) -> None:
     """Record all Nova data needed by the engine."""
     nova_dir = snapshot_dir / "nova"
     nova_dir.mkdir()
 
-    # Aggregates: for each policy, fetch hosts in its aggregate
+    # Resolve each aggregate (or the unassigned pool) to a host list.
+    # The key in the snapshot is the aggregate name, or the special
+    # marker for the unassigned pool.
+    from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
+
     aggregates: dict[str, list[str]] = {}
-    for policy in policies.policies:
-        if policy.aggregate not in aggregates:
-            try:
-                hosts = nova.get_aggregate_hosts(policy.aggregate)
-                aggregates[policy.aggregate] = hosts
-                LOG.info(
-                    "Recorded aggregate '%s': %d hosts",
-                    policy.aggregate,
-                    len(hosts),
-                )
-            except Exception:
-                LOG.error(
-                    "Failed to fetch aggregate '%s'",
-                    policy.aggregate,
-                    exc_info=True,
-                )
-                aggregates[policy.aggregate] = []
+    for name in aggregate_names:
+        key = name if name is not None else UNASSIGNED_TOPIC_MARKER
+        try:
+            hosts = nova.get_hosts_in_aggregate(name)
+            aggregates[key] = hosts
+            LOG.info("Recorded aggregate '%s': %d hosts", key, len(hosts))
+        except Exception:
+            LOG.error("Failed to fetch aggregate '%s'", key, exc_info=True)
+            aggregates[key] = []
 
     (nova_dir / "aggregates.json").write_text(
         json.dumps(aggregates, indent=2),
@@ -200,9 +196,21 @@ def main() -> int:
         return 1
 
     policies = load_policies(CONF.engine.policies_file)
+    aggregate_names: list[str | None] = list(CONF.engine.aggregates)
+    if CONF.engine.include_unassigned_hosts:
+        aggregate_names.append(None)
+
+    if not aggregate_names:
+        LOG.error(
+            "No aggregates to record. Set [engine] aggregates or "
+            "[engine] include_unassigned_hosts in kronos.conf.",
+        )
+        return 1
+
     LOG.info(
-        "Recording snapshot for %d policies to %s",
+        "Recording snapshot for %d policies across %d aggregates to %s",
         len(policies.policies),
+        len(aggregate_names),
         output_dir,
     )
 
@@ -215,6 +223,10 @@ def main() -> int:
                 "recorded_at": datetime.now(tz=UTC).isoformat(),
                 "policies_file": CONF.engine.policies_file,
                 "policy_names": [p.name for p in policies.policies],
+                "aggregates": [
+                    a if a is not None else "_unassigned_"
+                    for a in aggregate_names
+                ],
             },
             indent=2,
         ),
@@ -223,7 +235,7 @@ def main() -> int:
     nova = NovaClient(CONF)
     prometheus = PrometheusClient(CONF)
 
-    _record_nova(nova, policies, output_dir)
+    _record_nova(nova, aggregate_names, output_dir)
     _record_prometheus(prometheus, policies, output_dir)
 
     LOG.info("Snapshot written to %s", output_dir)

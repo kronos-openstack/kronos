@@ -56,10 +56,25 @@ def main() -> int:
         )
         for p in policies.policies:
             status = "enabled" if p.enabled else "disabled"
-            print(f"      {p.name} [{p.mode.value}] aggregate={p.aggregate} ({status})")
+            print(f"      {p.name} [{p.mode.value}] weight={p.weight} ({status})")
     except KronosException as exc:
         _print_fail(f"Policy file error: {exc}")
         return EXIT_CONFIG_ERROR
+
+    # 1b. Engine aggregate scope
+    print("\n--- Engine Scope ---")
+    aggregate_names: list[str | None] = list(CONF.engine.aggregates)
+    if CONF.engine.include_unassigned_hosts:
+        aggregate_names.append(None)
+    if not aggregate_names:
+        _print_fail(
+            "No aggregates to manage. Set [engine] aggregates or "
+            "[engine] include_unassigned_hosts.",
+        )
+        return EXIT_CONFIG_ERROR
+    for a in aggregate_names:
+        label = a if a is not None else "<unassigned>"
+        _print_ok(f"Aggregate: {label}")
 
     # 2. Test Prometheus
     print("\n--- Prometheus ---")
@@ -85,17 +100,16 @@ def main() -> int:
         _print_fail(f"Nova error: {exc}")
         return EXIT_NOVA_ERROR
 
-    # 4. Check aggregates
+    # 4. Resolve each aggregate in the engine scope
     print("\n--- Aggregates ---")
     aggregates_ok = True
-    for p in policies.policies:
-        if not p.enabled:
-            continue
+    for a in aggregate_names:
+        label = a if a is not None else "<unassigned>"
         try:
-            hosts = nova.get_aggregate_hosts(p.aggregate)
-            _print_ok(f"Aggregate '{p.aggregate}': {len(hosts)} hosts")
+            hosts = nova.get_hosts_in_aggregate(a)
+            _print_ok(f"Aggregate '{label}': {len(hosts)} hosts")
         except KronosException as exc:
-            _print_fail(f"Aggregate '{p.aggregate}': {exc}")
+            _print_fail(f"Aggregate '{label}': {exc}")
             aggregates_ok = False
 
     if not aggregates_ok:
