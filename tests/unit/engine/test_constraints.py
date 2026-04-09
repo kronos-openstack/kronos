@@ -15,7 +15,8 @@ def _vm(uuid: str, host: str = "h1") -> VmProfile:
         instance_uuid=uuid,
         instance_name=f"vm-{uuid}",
         host=host,
-        weight=0.1,
+        weights={"test": 0.1},
+        sources={"test": "prometheus"},
     )
 
 
@@ -81,6 +82,22 @@ class TestAntiAffinity:
         vms_by_host = {"h2": [_vm("vm-2", "h2")]}
 
         assert checker.check(vm, "h2", vms_by_host) is True
+
+    def test_soft_anti_affinity_blocks_move(
+        self, checker: ConstraintChecker, mock_nova: MagicMock,
+    ) -> None:
+        """Soft anti-affinity groups are also blocked — we respect the hint."""
+        mock_nova.list_server_groups.return_value = [
+            {
+                "id": "g1",
+                "policies": ["soft-anti-affinity"],
+                "members": ["vm-1", "vm-2"],
+            },
+        ]
+        vm = _vm("vm-1", "h1")
+        vms_by_host = {"h2": [_vm("vm-2", "h2")]}
+
+        assert checker.check(vm, "h2", vms_by_host) is False
 
     def test_cache_invalidation(
         self, checker: ConstraintChecker, mock_nova: MagicMock,

@@ -243,25 +243,42 @@ class NovaClient:
         return instances
 
     def list_server_groups(self) -> list[dict[str, object]]:
-        """List server groups (for anti-affinity constraints in M2+).
+        """List server groups across all projects.
 
-        :returns: List of server group dicts.
+        Nova exposes both the legacy ``policy`` (singular string) and the
+        current ``policies`` (list) attribute depending on the API
+        microversion.  Older deployments populate only the singular field;
+        newer ones populate the list.  We merge both into a ``policies``
+        list so the constraint checker has a single shape to reason about.
+
+        :returns: List of server group dicts with keys id, name, policies, members.
         """
         try:
-            groups = list(self._conn.compute.server_groups())
-            return [
-                {
-                    "id": g.id,
-                    "name": g.name,
-                    "policies": list(g.policies or []),
-                    "members": list(g.member_ids or []),
-                }
-                for g in groups
-            ]
+            groups = list(self._conn.compute.server_groups(all_projects=True))
         except Exception as exc:
             raise NovaClientError(
                 reason=f"Failed to list server groups: {exc}"
             ) from exc
+
+        result: list[dict[str, object]] = []
+        for g in groups:
+            policies: list[str] = []
+            raw_policies = getattr(g, "policies", None)
+            if raw_policies:
+                policies.extend(str(p) for p in raw_policies)
+            raw_policy = getattr(g, "policy", None)
+            if raw_policy and str(raw_policy) not in policies:
+                policies.append(str(raw_policy))
+
+            result.append(
+                {
+                    "id": g.id,
+                    "name": g.name,
+                    "policies": policies,
+                    "members": list(g.member_ids or []),
+                },
+            )
+        return result
 
     # --- M3: Write operations ---
 

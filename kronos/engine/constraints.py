@@ -105,18 +105,25 @@ class ConstraintChecker:
             )
             return self._anti_affinity_groups
 
+        # Both hard and soft anti-affinity are treated as move-blocking.
+        # Nova's soft-anti-affinity is best-effort at placement time;
+        # Kronos respects it as a hint at migration time so we never
+        # deliberately collapse a previously-spread group.
+        anti_affinity_policies = {"anti-affinity", "soft-anti-affinity"}
+
         for group in groups:
             group_policies = group.get("policies") or []
             if not isinstance(group_policies, list):
                 continue
-            if "anti-affinity" in group_policies:
-                group_id = str(group.get("id", ""))
-                raw_members = group.get("members") or []
-                if not isinstance(raw_members, list):
-                    continue
-                members = {str(m) for m in raw_members}
-                if members:
-                    self._anti_affinity_groups[group_id] = members
+            if not anti_affinity_policies.intersection(group_policies):
+                continue
+            group_id = str(group.get("id", ""))
+            raw_members = group.get("members") or []
+            if not isinstance(raw_members, list):
+                continue
+            members = {str(m) for m in raw_members}
+            if members:
+                self._anti_affinity_groups[group_id] = members
 
         LOG.info(
             "Loaded %d anti-affinity server groups.",

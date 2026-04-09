@@ -219,11 +219,13 @@ class TestListInstancesOnHost:
 
 
 class TestListServerGroups:
-    def test_returns_groups(self, mock_nova_client):
+    def test_returns_groups_with_policies_list(self, mock_nova_client):
+        """Modern microversion uses the 'policies' list attribute."""
         group = MagicMock()
         group.id = "sg-1"
         group.name = "anti-affinity-group"
         group.policies = ["anti-affinity"]
+        group.policy = None
         group.member_ids = ["uuid-1", "uuid-2"]
         mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
 
@@ -232,6 +234,32 @@ class TestListServerGroups:
         assert result[0]["name"] == "anti-affinity-group"
         assert result[0]["policies"] == ["anti-affinity"]
         assert result[0]["members"] == ["uuid-1", "uuid-2"]
+
+    def test_returns_groups_with_legacy_policy_attr(self, mock_nova_client):
+        """Older Nova deployments only populate the singular 'policy' attribute."""
+        group = MagicMock()
+        group.id = "sg-2"
+        group.name = "soft-group"
+        group.policies = None
+        group.policy = "soft-anti-affinity"
+        group.member_ids = ["uuid-3"]
+        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+
+        result = mock_nova_client.list_server_groups()
+        assert result[0]["policies"] == ["soft-anti-affinity"]
+
+    def test_merges_legacy_and_modern_attrs(self, mock_nova_client):
+        """Both attributes populated → merge without duplicates."""
+        group = MagicMock()
+        group.id = "sg-3"
+        group.name = "both"
+        group.policies = ["anti-affinity"]
+        group.policy = "anti-affinity"
+        group.member_ids = []
+        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+
+        result = mock_nova_client.list_server_groups()
+        assert result[0]["policies"] == ["anti-affinity"]
 
     def test_api_error(self, mock_nova_client):
         mock_nova_client._mock_conn.compute.server_groups.side_effect = Exception("fail")
