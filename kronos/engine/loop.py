@@ -1,4 +1,15 @@
-"""Main engine control loop."""
+"""Main engine control loop.
+
+The engine operates on a fixed set of aggregates defined at startup via
+``[engine] aggregates`` and ``[engine] include_unassigned_hosts``.  Each
+aggregate is evaluated independently every cycle:
+
+1. resolve aggregate → host list via Nova
+2. run every enabled policy against that host list (scorer)
+3. collect VM profiles for all policies in one pass (profiler)
+4. combined-scoring planner produces at most one migration plan
+5. cast migration tasks over RPC to the executor (unless dry_run)
+"""
 
 from __future__ import annotations
 
@@ -15,9 +26,8 @@ from oslo_log import log as logging
 from kronos.clients.nova import NovaClient
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.messaging import (
-    emit_notification,
-    get_notifier,
-    get_transport,
+    get_rpc_client,
+    get_rpc_transport,
     migrations_topic,
     task_to_dict,
 )
@@ -27,6 +37,7 @@ from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.scorer import PolicyScorer
 from kronos.engine.types import (
+    AggregateResult,
     CycleReport,
     MigrationPlan,
     MigrationTask,
@@ -39,45 +50,50 @@ LOG = logging.getLogger(__name__)
 
 
 class EngineLoop:
-    """Periodic evaluation loop.
-
-    Evaluates all enabled policies on each cycle.  When imbalance is
-    detected, collects VM profiles and runs the planner to produce a
-    migration plan.  In M2 the plan is logged (dry-run only).
-    """
+    """Periodic per-aggregate evaluation loop with combined scoring."""
 
     def __init__(self, conf: cfg.ConfigOpts) -> None:
         self._conf = conf
         self._prometheus = PrometheusClient(conf)
         self._nova = NovaClient(conf)
-        self._scorer = PolicyScorer(self._prometheus, self._nova)
+        self._scorer = PolicyScorer(self._prometheus)
         self._profiler = VmProfiler(self._prometheus, self._nova)
         self._constraints = ConstraintChecker(self._nova)
         self._planner = Planner(self._constraints)
         self._cooldown = CooldownTracker(
+            aggregate_cooldown_seconds=float(conf.engine.cooldown),
             instance_cooldown_seconds=float(conf.engine.instance_cooldown),
         )
         self._running = False
         self._cycle_count = 0
 
-        # Messaging — only initialised when dry_run=False
-        self._notifiers: dict[str, oslo_messaging.Notifier] = {}
-        self._transport: oslo_messaging.Transport | None = None
+        # Messaging — only initialised when dry_run=False.
+        # Keys: aggregate name, or None for the unassigned-hosts pool.
+        self._rpc_clients: dict[str | None, oslo_messaging.RPCClient] = {}
+        self._rpc_transport: oslo_messaging.Transport | None = None
 
     def start(self) -> None:
-        """Start the evaluation loop. Blocks until stopped."""
+        """Start the evaluation loop.  Blocks until stopped."""
         policies = load_policies(self._conf.engine.policies_file)
         interval = self._conf.engine.evaluation_interval
         dry_run = self._conf.engine.dry_run
+        aggregates = self._resolve_aggregates()
+
+        if not aggregates:
+            raise RuntimeError(
+                "Engine has no aggregates to manage. Set [engine] aggregates "
+                "or [engine] include_unassigned_hosts in kronos.conf.",
+            )
 
         if not dry_run:
-            self._init_messaging(policies)
+            self._init_messaging(aggregates)
 
         LOG.info(
-            "Starting engine loop: interval=%ds, dry_run=%s, policies=%d",
+            "Starting engine loop: interval=%ds, dry_run=%s, policies=%d, aggregates=%s",
             interval,
             dry_run,
             len(policies.policies),
+            [a if a is not None else "<unassigned>" for a in aggregates],
         )
 
         self._running = True
@@ -85,7 +101,7 @@ class EngineLoop:
         signal.signal(signal.SIGINT, self._handle_signal)
 
         while self._running:
-            report = self._run_cycle(policies, dry_run)
+            report = self._run_cycle(policies, aggregates, dry_run)
             self._log_report(report)
 
             if self._running:
@@ -97,12 +113,35 @@ class EngineLoop:
         """Signal the loop to stop after the current cycle."""
         self._running = False
 
-    def _run_cycle(self, policies: PoliciesConfig, dry_run: bool) -> CycleReport:
-        """Evaluate all enabled policies once."""
+    def _resolve_aggregates(self) -> list[str | None]:
+        """Build the list of aggregate names (and optional None for unassigned)."""
+        result: list[str | None] = list(self._conf.engine.aggregates)
+        if self._conf.engine.include_unassigned_hosts:
+            result.append(None)
+        return result
+
+    def _init_messaging(self, aggregates: list[str | None]) -> None:
+        """Create one RPC client per aggregate (or for the unassigned pool)."""
+        self._rpc_transport = get_rpc_transport(self._conf)
+        for aggregate in aggregates:
+            self._rpc_clients[aggregate] = get_rpc_client(
+                self._rpc_transport, aggregate,
+            )
+            LOG.info(
+                "RPC client ready for topic '%s'",
+                migrations_topic(aggregate),
+            )
+
+    def _run_cycle(
+        self,
+        policies: PoliciesConfig,
+        aggregates: list[str | None],
+        dry_run: bool,
+    ) -> CycleReport:
+        """Evaluate every aggregate in the engine's scope once."""
         self._cycle_count += 1
         started_at = datetime.now(tz=UTC)
 
-        # Invalidate constraint caches each cycle
         self._constraints.invalidate_cache()
 
         report = CycleReport(
@@ -112,87 +151,120 @@ class EngineLoop:
             dry_run=dry_run,
         )
 
-        for policy in policies.policies:
-            if not policy.enabled:
-                continue
+        enabled_policies = [p for p in policies.policies if p.enabled]
 
+        for aggregate in aggregates:
             try:
-                result = self._evaluate_policy(policy, dry_run)
-                report.policy_results.append(result)
+                result = self._evaluate_aggregate(
+                    aggregate, enabled_policies, dry_run,
+                )
+                report.aggregate_results.append(result)
             except Exception as exc:
-                error_msg = f"Policy '{policy.name}': {exc}"
+                name = aggregate if aggregate is not None else "<unassigned>"
+                error_msg = f"Aggregate '{name}': {exc}"
                 LOG.error("Evaluation error: %s", error_msg)
                 report.errors.append(error_msg)
 
         report.completed_at = datetime.now(tz=UTC)
         return report
 
-    def _init_messaging(self, policies: PoliciesConfig) -> None:
-        """Initialise oslo.messaging transport and per-aggregate notifiers.
+    def _evaluate_aggregate(
+        self,
+        aggregate: str | None,
+        policies: list[PolicyConfig],
+        dry_run: bool,
+    ) -> AggregateResult:
+        """Run all policies against one aggregate and plan migrations."""
+        name = aggregate if aggregate is not None else "<unassigned>"
+        hosts = self._nova.get_hosts_in_aggregate(aggregate)
 
-        :raises: Exception if transport creation fails — the engine must
-            not start in non-dry-run mode without a working transport.
-        """
-        self._transport = get_transport(self._conf)
+        result = AggregateResult(aggregate=name)
 
-        aggregates = {p.aggregate for p in policies.policies if p.enabled}
-        for aggregate in aggregates:
-            topic = migrations_topic(aggregate)
-            self._notifiers[aggregate] = get_notifier(
-                self._transport, topic, publisher_id=f"kronos-engine-{aggregate}",
-            )
-            LOG.info("Messaging notifier ready for topic '%s'", topic)
-
-    def _evaluate_policy(self, policy: PolicyConfig, dry_run: bool) -> PolicyResult:
-        """Score a policy, and if imbalanced, profile VMs and plan migrations."""
-        result = self._scorer.evaluate(policy)
-
-        if result.skipped or not result.imbalance_detected:
+        if not hosts:
+            LOG.info("Aggregate '%s' has no hosts, skipping.", name)
             return result
 
-        # Skip planning if the policy is still cooling down
-        if not dry_run and self._cooldown.is_policy_cooling(policy.name, policy.cooldown):
+        # Score every policy in turn
+        policy_results: list[PolicyResult] = [
+            self._scorer.evaluate(policy, hosts) for policy in policies
+        ]
+        result.policy_results = policy_results
+
+        # Combined imbalance signal — weighted sum across all non-skipped policies
+        combined_imbalance = 0.0
+        any_detected = False
+        for policy, pr in zip(policies, policy_results, strict=True):
+            if pr.skipped:
+                continue
+            combined_imbalance += policy.weight * pr.imbalance
+            if pr.imbalance_detected:
+                any_detected = True
+        result.combined_imbalance = combined_imbalance
+        result.imbalance_detected = any_detected
+
+        if not any_detected:
+            return result
+
+        # Cooldown check
+        if not dry_run and self._cooldown.is_aggregate_cooling(name):
             LOG.info(
-                "Policy '%s': imbalance detected but cooldown active, skipping planning.",
-                policy.name,
+                "Aggregate '%s': imbalance detected but cooldown active, skipping planning.",
+                name,
             )
             return result
 
-        # Imbalance detected — collect VM profiles and plan
-        raw_scores = {hs.host: hs.raw_score for hs in result.host_scores}
-        aggregate_hosts = list(raw_scores.keys())
-
+        # Collect per-policy VM profiles
+        active_policies = [
+            p for p, pr in zip(policies, policy_results, strict=True)
+            if not pr.skipped
+        ]
+        host_scores_by_policy = {
+            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
+            for p, pr in zip(policies, policy_results, strict=True)
+            if not pr.skipped
+        }
         vm_profiles = self._profiler.collect(
-            policy=policy,
-            aggregate_hosts=aggregate_hosts,
-            host_scores=raw_scores,
+            policies=active_policies,
+            hosts=hosts,
+            host_scores_by_policy=host_scores_by_policy,
         )
         result.vm_profiles = vm_profiles
 
-        if vm_profiles:
-            plan = self._planner.plan(
-                policy=policy,
-                host_scores=result.host_scores,
-                vm_profiles=vm_profiles,
-            )
-            result.migration_plan = plan
+        if not vm_profiles:
+            return result
 
-            if not dry_run and plan.steps:
-                self._emit_plan(plan, policy)
-                self._cooldown.record_plan_emission(
-                    policy.name,
-                    [step.instance_uuid for step in plan.steps],
-                )
+        # Plan with combined scoring
+        plan = self._planner.plan(
+            aggregate=name,
+            policies=active_policies,
+            policy_results=[
+                pr for p, pr in zip(policies, policy_results, strict=True)
+                if not pr.skipped
+            ],
+            vm_profiles=vm_profiles,
+        )
+        result.migration_plan = plan
+
+        if not dry_run and plan.steps:
+            self._emit_plan(plan, aggregate)
+            self._cooldown.record_plan_emission(
+                name,
+                [step.instance_uuid for step in plan.steps],
+            )
 
         return result
 
-    def _emit_plan(self, plan: MigrationPlan, policy: PolicyConfig) -> None:
-        """Publish migration tasks to the aggregate's messaging topic."""
-        notifier = self._notifiers.get(policy.aggregate)
-        if notifier is None:
+    def _emit_plan(
+        self,
+        plan: MigrationPlan,
+        aggregate: str | None,
+    ) -> None:
+        """RPC cast migration tasks for the aggregate's executor."""
+        client = self._rpc_clients.get(aggregate)
+        if client is None:
             LOG.warning(
-                "No notifier for aggregate '%s'; skipping plan emission.",
-                policy.aggregate,
+                "No RPC client for aggregate '%s'; skipping plan emission.",
+                plan.aggregate,
             )
             return
 
@@ -204,14 +276,14 @@ class EngineLoop:
             task = MigrationTask.from_step(
                 step=step,
                 plan_id=plan_id,
-                policy_name=policy.name,
-                aggregate=policy.aggregate,
+                aggregate=plan.aggregate,
+                policy_names=plan.policy_names,
                 not_before=base_time + (i * stagger),
                 max_retries=self._conf.executor.max_retries,
             )
-            emit_notification(notifier, "migration.requested", task_to_dict(task))
+            client.cast({}, "execute_migration", task=task_to_dict(task))
             LOG.info(
-                "Emitted migration task %s: %s (%s) %s -> %s "
+                "Cast migration task %s: %s (%s) %s -> %s "
                 "(plan=%s, not_before=+%ds)",
                 task.task_id[:8],
                 step.instance_name,
@@ -223,74 +295,74 @@ class EngineLoop:
             )
 
     def _log_report(self, report: CycleReport) -> None:
-        """Log cycle results."""
         duration = (report.completed_at - report.started_at).total_seconds()
 
         LOG.info(
-            "Cycle #%d completed in %.1fs: %d policies evaluated, %d errors",
+            "Cycle #%d completed in %.1fs: %d aggregates, %d errors",
             report.cycle_number,
             duration,
-            len(report.policy_results),
+            len(report.aggregate_results),
             len(report.errors),
         )
 
-        for result in report.policy_results:
-            if result.skipped:
-                LOG.info(
-                    "  [SKIP] %s: %s",
-                    result.policy_name,
-                    result.skip_reason,
+        for ar in report.aggregate_results:
+            self._log_aggregate_result(ar)
+
+    @staticmethod
+    def _log_aggregate_result(ar: AggregateResult) -> None:
+        if ar.imbalance_detected:
+            LOG.info(
+                "  [IMBALANCE] %s: combined=%.3f",
+                ar.aggregate,
+                ar.combined_imbalance,
+            )
+        else:
+            LOG.info(
+                "  [OK] %s: combined=%.3f (within thresholds)",
+                ar.aggregate,
+                ar.combined_imbalance,
+            )
+
+        for pr in ar.policy_results:
+            if pr.skipped:
+                LOG.info("    [SKIP] %s: %s", pr.policy_name, pr.skip_reason)
+                continue
+            marker = "⚠" if pr.imbalance_detected else " "
+            LOG.info(
+                "    %s %s: imbalance=%.3f",
+                marker,
+                pr.policy_name,
+                pr.imbalance,
+            )
+            for hs in pr.host_scores:
+                LOG.debug(
+                    "        %s: raw=%.3f normalized=%.3f",
+                    hs.host,
+                    hs.raw_score,
+                    hs.normalized_score,
                 )
-            elif result.imbalance_detected:
-                LOG.info(
-                    "  [IMBALANCE] %s: imbalance=%.3f",
-                    result.policy_name,
-                    result.imbalance,
-                )
-                for hs in result.host_scores:
-                    LOG.info(
-                        "    %s: raw=%.3f normalized=%.3f",
-                        hs.host,
-                        hs.raw_score,
-                        hs.normalized_score,
-                    )
-                self._log_migration_plan(result.migration_plan)
-            else:
-                LOG.info(
-                    "  [OK] %s: imbalance=%.3f (within threshold)",
-                    result.policy_name,
-                    result.imbalance,
-                )
-                for hs in result.host_scores:
-                    LOG.debug(
-                        "    %s: raw=%.3f normalized=%.3f",
-                        hs.host,
-                        hs.raw_score,
-                        hs.normalized_score,
-                    )
+
+        EngineLoop._log_migration_plan(ar.migration_plan)
 
     @staticmethod
     def _log_migration_plan(plan: MigrationPlan | None) -> None:
-        """Log a migration plan (dry-run output)."""
         if plan is None or not plan.steps:
-            LOG.info("    No migrations proposed.")
             return
 
         LOG.info(
-            "    Migration plan: %d steps, imbalance %.3f -> %.3f (projected)",
+            "    Migration plan: %d steps, combined %.3f -> %.3f (projected)",
             plan.migration_count,
             plan.initial_imbalance,
             plan.projected_imbalance,
         )
         for i, step in enumerate(plan.steps, 1):
             LOG.info(
-                "    [%d] %s (%s): %s -> %s (weight=%.3f, improvement=%.3f)",
+                "    [%d] %s (%s): %s -> %s (improvement=%.3f)",
                 i,
                 step.instance_name,
                 step.instance_uuid[:8],
                 step.from_host,
                 step.to_host,
-                step.weight,
                 step.improvement,
             )
 

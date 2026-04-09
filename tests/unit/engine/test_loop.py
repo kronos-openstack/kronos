@@ -8,7 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from kronos.engine.loop import EngineLoop
-from kronos.engine.types import CycleReport, HostScore, MigrationPlan, MigrationStep, PolicyResult
+from kronos.engine.types import (
+    AggregateResult,
+    CycleReport,
+    HostScore,
+    MigrationPlan,
+    MigrationStep,
+    PolicyResult,
+)
 from kronos.policies.models import PoliciesConfig, PolicyConfig, PolicyMode
 
 
@@ -16,10 +23,9 @@ def _make_policy(**overrides: object) -> PolicyConfig:
     defaults: dict[str, object] = {
         "name": "test-policy",
         "mode": "spread",
-        "aggregate": "test-agg",
+        "weight": 1.0,
         "imbalance_query": "test_metric",
         "threshold": 0.15,
-        "cooldown": "10m",
     }
     defaults.update(overrides)
     return PolicyConfig(**defaults)
@@ -35,12 +41,12 @@ def _make_policy_result(
     policy_name: str = "test-policy",
     imbalance_detected: bool = False,
     skipped: bool = False,
+    host_scores: list[HostScore] | None = None,
 ) -> PolicyResult:
     return PolicyResult(
         policy_name=policy_name,
         mode=PolicyMode.SPREAD,
-        aggregate="test-agg",
-        host_scores=[],
+        host_scores=host_scores or [],
         imbalance=0.05,
         imbalance_detected=imbalance_detected,
         timestamp=datetime.now(tz=UTC),
@@ -54,7 +60,6 @@ def _make_imbalanced_result() -> PolicyResult:
     return PolicyResult(
         policy_name="test-policy",
         mode=PolicyMode.SPREAD,
-        aggregate="test-agg",
         host_scores=[
             HostScore(host="h1", raw_score=0.8, normalized_score=1.0),
             HostScore(host="h2", raw_score=0.2, normalized_score=0.0),
@@ -68,10 +73,10 @@ def _make_imbalanced_result() -> PolicyResult:
 
 @pytest.fixture()
 def mock_engine():
-    """Create an EngineLoop with all dependencies mocked."""
+    """Create an EngineLoop with all external dependencies mocked."""
     with (
         patch("kronos.engine.loop.PrometheusClient"),
-        patch("kronos.engine.loop.NovaClient"),
+        patch("kronos.engine.loop.NovaClient") as mock_nova_cls,
         patch("kronos.engine.loop.PolicyScorer") as mock_scorer_cls,
         patch("kronos.engine.loop.VmProfiler") as mock_profiler_cls,
         patch("kronos.engine.loop.ConstraintChecker"),
@@ -82,46 +87,46 @@ def mock_engine():
         conf.engine.dry_run = True
         conf.engine.policies_file = "/etc/kronos/policies.yaml"
         conf.engine.instance_cooldown = 900
+        conf.engine.cooldown = 600
+        conf.engine.aggregates = ["test-agg"]
+        conf.engine.include_unassigned_hosts = False
 
         engine = EngineLoop(conf)
+        engine._nova = mock_nova_cls.return_value
         engine._scorer = mock_scorer_cls.return_value
         engine._profiler = mock_profiler_cls.return_value
         engine._planner = mock_planner_cls.return_value
+
+        # Default: one host in the test aggregate
+        engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2"]
         yield engine
 
 
 class TestRunCycle:
-    def test_evaluates_enabled_policies(self, mock_engine: EngineLoop) -> None:
-        p1 = _make_policy(name="enabled-policy")
-        p2 = _make_policy(name="disabled-policy", enabled=False)
-        policies = _make_policies_config(p1, p2)
-
+    def test_evaluates_aggregates(self, mock_engine: EngineLoop) -> None:
+        policies = _make_policies_config(_make_policy(name="enabled-policy"))
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-        report = mock_engine._run_cycle(policies, dry_run=True)
+        report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
 
         assert isinstance(report, CycleReport)
-        assert len(report.policy_results) == 1
-        mock_engine._scorer.evaluate.assert_called_once_with(p1)
+        assert len(report.aggregate_results) == 1
 
     def test_captures_evaluation_errors(self, mock_engine: EngineLoop) -> None:
-        policy = _make_policy()
-        policies = _make_policies_config(policy)
+        policies = _make_policies_config(_make_policy())
+        mock_engine._nova.get_hosts_in_aggregate.side_effect = Exception("boom")
 
-        mock_engine._scorer.evaluate.side_effect = Exception("boom")
-
-        report = mock_engine._run_cycle(policies, dry_run=True)
+        report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
 
         assert len(report.errors) == 1
         assert "boom" in report.errors[0]
-        assert len(report.policy_results) == 0
 
     def test_cycle_number_increments(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-        r1 = mock_engine._run_cycle(policies, dry_run=True)
-        r2 = mock_engine._run_cycle(policies, dry_run=True)
+        r1 = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
+        r2 = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
 
         assert r1.cycle_number == 1
         assert r2.cycle_number == 2
@@ -130,67 +135,100 @@ class TestRunCycle:
         policies = _make_policies_config(_make_policy())
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-        report = mock_engine._run_cycle(policies, dry_run=True)
+        report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
         assert report.dry_run is True
 
-    def test_multiple_policies(self, mock_engine: EngineLoop) -> None:
-        p1 = _make_policy(name="policy-a")
-        p2 = _make_policy(name="policy-b")
-        policies = _make_policies_config(p1, p2)
+    def test_multi_aggregate(self, mock_engine: EngineLoop) -> None:
+        policies = _make_policies_config(_make_policy())
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-        mock_engine._scorer.evaluate.side_effect = [
-            _make_policy_result(policy_name="policy-a"),
-            _make_policy_result(policy_name="policy-b"),
-        ]
-
-        report = mock_engine._run_cycle(policies, dry_run=True)
-        assert len(report.policy_results) == 2
+        report = mock_engine._run_cycle(
+            policies, ["agg-a", "agg-b"], dry_run=True,
+        )
+        assert len(report.aggregate_results) == 2
 
     def test_completed_at_after_started_at(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-        report = mock_engine._run_cycle(policies, dry_run=True)
+        report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
         assert report.completed_at >= report.started_at
 
 
-class TestEvaluatePolicy:
+class TestEvaluateAggregate:
+    def test_no_hosts_returns_empty(self, mock_engine: EngineLoop) -> None:
+        mock_engine._nova.get_hosts_in_aggregate.return_value = []
+        result = mock_engine._evaluate_aggregate(
+            "empty-agg", [_make_policy()], dry_run=True,
+        )
+        assert result.aggregate == "empty-agg"
+        assert not result.imbalance_detected
+
     def test_balanced_skips_planner(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
-        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+        )
 
         assert result.migration_plan is None
         mock_engine._profiler.collect.assert_not_called()
         mock_engine._planner.plan.assert_not_called()
 
-    def test_skipped_skips_planner(self, mock_engine: EngineLoop) -> None:
+    def test_skipped_policy(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_policy_result(skipped=True)
-        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+        )
 
-        assert result.migration_plan is None
+        assert not result.imbalance_detected
         mock_engine._profiler.collect.assert_not_called()
 
     def test_imbalanced_triggers_planner(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
         mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
-        mock_engine._planner.plan.return_value = MigrationPlan(
-            policy_name="test-policy", aggregate="test-agg",
-        )
+        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
 
-        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+        )
 
         mock_engine._profiler.collect.assert_called_once()
         mock_engine._planner.plan.assert_called_once()
         assert result.migration_plan is not None
+        assert result.imbalance_detected
 
     def test_no_vm_profiles_skips_planner(self, mock_engine: EngineLoop) -> None:
         mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
         mock_engine._profiler.collect.return_value = {}
 
-        result = mock_engine._evaluate_policy(_make_policy(), dry_run=True)
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+        )
 
         mock_engine._planner.plan.assert_not_called()
         assert result.migration_plan is None
+
+
+class TestResolveAggregates:
+    def test_aggregates_only(self, mock_engine: EngineLoop) -> None:
+        mock_engine._conf.engine.aggregates = ["a", "b"]
+        mock_engine._conf.engine.include_unassigned_hosts = False
+        assert mock_engine._resolve_aggregates() == ["a", "b"]
+
+    def test_only_unassigned(self, mock_engine: EngineLoop) -> None:
+        mock_engine._conf.engine.aggregates = []
+        mock_engine._conf.engine.include_unassigned_hosts = True
+        assert mock_engine._resolve_aggregates() == [None]
+
+    def test_both(self, mock_engine: EngineLoop) -> None:
+        mock_engine._conf.engine.aggregates = ["a"]
+        mock_engine._conf.engine.include_unassigned_hosts = True
+        assert mock_engine._resolve_aggregates() == ["a", None]
+
+    def test_neither(self, mock_engine: EngineLoop) -> None:
+        mock_engine._conf.engine.aggregates = []
+        mock_engine._conf.engine.include_unassigned_hosts = False
+        assert mock_engine._resolve_aggregates() == []
 
 
 class TestLogReport:
@@ -199,7 +237,12 @@ class TestLogReport:
             cycle_number=1,
             started_at=datetime.now(tz=UTC),
             completed_at=datetime.now(tz=UTC),
-            policy_results=[_make_policy_result()],
+            aggregate_results=[
+                AggregateResult(
+                    aggregate="agg",
+                    policy_results=[_make_policy_result()],
+                ),
+            ],
         )
         mock_engine._log_report(report)
 
@@ -208,44 +251,42 @@ class TestLogReport:
             cycle_number=1,
             started_at=datetime.now(tz=UTC),
             completed_at=datetime.now(tz=UTC),
-            policy_results=[_make_policy_result(skipped=True)],
+            aggregate_results=[
+                AggregateResult(
+                    aggregate="agg",
+                    policy_results=[_make_policy_result(skipped=True)],
+                ),
+            ],
         )
         mock_engine._log_report(report)
 
     def test_logs_imbalance_with_plan(self, mock_engine: EngineLoop) -> None:
-        result = _make_imbalanced_result()
-        result.migration_plan = MigrationPlan(
-            policy_name="test-policy",
-            aggregate="test-agg",
-            steps=[
-                MigrationStep(
-                    instance_uuid="uuid-1",
-                    instance_name="vm-1",
-                    from_host="h1",
-                    to_host="h2",
-                    weight=0.2,
-                    improvement=0.1,
-                ),
-            ],
-            initial_imbalance=0.6,
-            projected_imbalance=0.3,
+        ar = AggregateResult(
+            aggregate="agg",
+            policy_results=[_make_imbalanced_result()],
+            combined_imbalance=0.6,
+            imbalance_detected=True,
+            migration_plan=MigrationPlan(
+                aggregate="agg",
+                policy_names=["test-policy"],
+                steps=[
+                    MigrationStep(
+                        instance_uuid="uuid-1",
+                        instance_name="vm-1",
+                        from_host="h1",
+                        to_host="h2",
+                        improvement=0.1,
+                    ),
+                ],
+                initial_imbalance=0.6,
+                projected_imbalance=0.3,
+            ),
         )
         report = CycleReport(
             cycle_number=1,
             started_at=datetime.now(tz=UTC),
             completed_at=datetime.now(tz=UTC),
-            policy_results=[result],
-        )
-        mock_engine._log_report(report)
-
-    def test_logs_imbalance_no_plan(self, mock_engine: EngineLoop) -> None:
-        result = _make_imbalanced_result()
-        result.migration_plan = None
-        report = CycleReport(
-            cycle_number=1,
-            started_at=datetime.now(tz=UTC),
-            completed_at=datetime.now(tz=UTC),
-            policy_results=[result],
+            aggregate_results=[ar],
         )
         mock_engine._log_report(report)
 

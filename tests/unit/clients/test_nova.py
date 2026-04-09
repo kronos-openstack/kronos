@@ -143,13 +143,25 @@ class TestGetAggregate:
             mock_nova_client.get_aggregate("nonexistent")
 
 
-class TestGetAggregateHosts:
+class TestGetHostsInAggregate:
     def test_returns_host_list(self, mock_nova_client):
         mock_agg = _make_mock_aggregate(hosts=["h1", "h2", "h3"])
         mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
 
-        hosts = mock_nova_client.get_aggregate_hosts("test-agg")
+        hosts = mock_nova_client.get_hosts_in_aggregate("test-agg")
         assert hosts == ["h1", "h2", "h3"]
+
+    def test_none_returns_unassigned(self, mock_nova_client):
+        # One aggregate contains h1 only; h2 is unassigned
+        mock_agg = _make_mock_aggregate(hosts=["h1"])
+        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+
+        hv1 = _make_mock_hypervisor(name="h1")
+        hv2 = _make_mock_hypervisor(name="h2")
+        mock_nova_client._mock_conn.compute.hypervisors.return_value = [hv1, hv2]
+
+        hosts = mock_nova_client.get_hosts_in_aggregate(None)
+        assert hosts == ["h2"]
 
 
 class TestListComputeHosts:

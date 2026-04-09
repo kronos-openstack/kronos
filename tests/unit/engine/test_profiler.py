@@ -21,14 +21,13 @@ def _make_policy(**overrides: object) -> PolicyConfig:
     defaults: dict[str, object] = {
         "name": "test-policy",
         "mode": "spread",
-        "aggregate": "test-agg",
+        "weight": 1.0,
         "imbalance_query": "test_metric",
         "vm_profile_query": "vm_metric",
         "vm_profile_label": "instance_name",
         "vm_profile_label_type": "nova_internal_name",
         "vm_profile_fallback": "skip",
         "threshold": 0.15,
-        "cooldown": "10m",
     }
     defaults.update(overrides)
     return PolicyConfig(**defaults)
@@ -119,7 +118,7 @@ class TestApplyFallback:
 
 
 class TestVmProfilerCollect:
-    def test_basic_collection(
+    def test_basic_collection_single_policy(
         self, profiler: VmProfiler, mock_nova: MagicMock, mock_prometheus: MagicMock,
     ) -> None:
         instances = [
@@ -132,19 +131,65 @@ class TestVmProfilerCollect:
         )
 
         policy = _make_policy()
-        profiles = profiler.collect(policy, ["h1", "h2"], {"h1": 0.4, "h2": 0.8})
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1", "h2"],
+            host_scores_by_policy={policy.name: {"h1": 0.4, "h2": 0.8}},
+        )
 
         assert len(profiles) == 2
-        assert profiles["u1"].weight == pytest.approx(0.3)
-        assert profiles["u2"].weight == pytest.approx(0.7)
-        assert profiles["u1"].source == "prometheus"
+        assert profiles["u1"].weights["test-policy"] == pytest.approx(0.3)
+        assert profiles["u2"].weights["test-policy"] == pytest.approx(0.7)
+        assert profiles["u1"].sources["test-policy"] == "prometheus"
+
+    def test_multi_policy_collection(
+        self, profiler: VmProfiler, mock_nova: MagicMock, mock_prometheus: MagicMock,
+    ) -> None:
+        instances = [
+            _make_instance(uuid="u1", internal_name="inst-001", host="h1"),
+        ]
+        mock_nova.list_instances_on_host.return_value = instances
+
+        def query_side_effect(query, label_key, expected_labels=None):
+            if query == "cpu_metric":
+                return _make_query_result({"inst-001": 0.1})
+            if query == "mem_metric":
+                return _make_query_result({"inst-001": 0.4})
+            return _make_query_result({})
+
+        mock_prometheus.instant_query.side_effect = query_side_effect
+
+        cpu = _make_policy(
+            name="cpu", weight=0.5, imbalance_query="cpu_host",
+            vm_profile_query="cpu_metric",
+        )
+        mem = _make_policy(
+            name="mem", weight=0.5, imbalance_query="mem_host",
+            vm_profile_query="mem_metric",
+        )
+        profiles = profiler.collect(
+            policies=[cpu, mem],
+            hosts=["h1"],
+            host_scores_by_policy={
+                "cpu": {"h1": 0.1},
+                "mem": {"h1": 0.4},
+            },
+        )
+
+        assert len(profiles) == 1
+        assert profiles["u1"].weights["cpu"] == pytest.approx(0.1)
+        assert profiles["u1"].weights["mem"] == pytest.approx(0.4)
 
     def test_no_instances(
         self, profiler: VmProfiler, mock_nova: MagicMock,
     ) -> None:
         mock_nova.list_instances_on_host.return_value = []
         policy = _make_policy()
-        profiles = profiler.collect(policy, ["h1"], {"h1": 0.5})
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1"],
+            host_scores_by_policy={policy.name: {"h1": 0.5}},
+        )
         assert profiles == {}
 
     def test_skip_fallback_excludes_vm(
@@ -155,13 +200,16 @@ class TestVmProfilerCollect:
             _make_instance(uuid="u2", internal_name="inst-002", host="h1"),
         ]
         mock_nova.list_instances_on_host.return_value = instances
-        # Only one VM has Prometheus data
         mock_prometheus.instant_query.return_value = _make_query_result(
             {"inst-001": 0.5},
         )
 
         policy = _make_policy(vm_profile_fallback="skip")
-        profiles = profiler.collect(policy, ["h1"], {"h1": 0.6})
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1"],
+            host_scores_by_policy={policy.name: {"h1": 0.6}},
+        )
 
         assert len(profiles) == 1
         assert "u1" in profiles
@@ -180,12 +228,16 @@ class TestVmProfilerCollect:
         )
 
         policy = _make_policy(vm_profile_fallback="host_average")
-        profiles = profiler.collect(policy, ["h1"], {"h1": 0.8})
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1"],
+            host_scores_by_policy={policy.name: {"h1": 0.8}},
+        )
 
         assert len(profiles) == 2
-        assert profiles["u1"].source == "prometheus"
-        assert profiles["u2"].source == "fallback:host_average"
-        assert profiles["u2"].weight == pytest.approx(0.4)  # 0.8 / 2
+        assert profiles["u1"].sources["test-policy"] == "prometheus"
+        assert profiles["u2"].sources["test-policy"] == "fallback:host_average"
+        assert profiles["u2"].weights["test-policy"] == pytest.approx(0.4)
 
     def test_no_vm_profile_query(
         self, profiler: VmProfiler, mock_nova: MagicMock, mock_prometheus: MagicMock,
@@ -194,8 +246,12 @@ class TestVmProfilerCollect:
         mock_nova.list_instances_on_host.return_value = instances
 
         policy = _make_policy(vm_profile_query=None, vm_profile_fallback="host_average")
-        profiles = profiler.collect(policy, ["h1"], {"h1": 0.6})
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1"],
+            host_scores_by_policy={policy.name: {"h1": 0.6}},
+        )
 
         assert len(profiles) == 1
-        assert profiles["u1"].source == "fallback:host_average"
+        assert profiles["u1"].sources["test-policy"] == "fallback:host_average"
         mock_prometheus.instant_query.assert_not_called()

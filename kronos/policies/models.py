@@ -1,32 +1,26 @@
-"""Pydantic v2 models for Kronos policy YAML configuration."""
+"""Pydantic v2 models for Kronos policy YAML configuration.
+
+All policies in a file apply to every aggregate the engine manages.
+Aggregates are defined at engine level via ``[engine] aggregates`` and
+``[engine] include_unassigned_hosts`` in ``kronos.conf``.
+
+Combined scoring: each policy contributes to a weighted sum used as the
+aggregate's imbalance score.  This requires:
+
+* All policies share the same ``mode`` (spread and pack are opposite
+  intents and cannot be combined).
+* Enabled policy ``weight`` values sum to 1.0.
+* Each ``imbalance_query`` returns values in [0, 1] — enforced at runtime
+  by the scorer.
+"""
 
 from __future__ import annotations
 
 import enum
-from datetime import timedelta
-from typing import Any, Self
+import math
+from typing import Self
 
-import pytimeparse2
-from pydantic import BaseModel, Field, field_validator, model_validator
-
-
-def parse_duration(value: str | int | float | timedelta) -> timedelta:
-    """Parse a duration value into a timedelta.
-
-    Accepts:
-        - timedelta objects (passthrough)
-        - int/float (interpreted as seconds)
-        - strings: "10m", "1h", "1h30m", "1 hour 30 minutes", etc.
-    """
-    if isinstance(value, timedelta):
-        return value
-    if isinstance(value, (int, float)):
-        return timedelta(seconds=value)
-
-    seconds = pytimeparse2.parse(value)
-    if seconds is None:
-        raise ValueError(f"Cannot parse duration string: {value!r}")
-    return timedelta(seconds=seconds)
+from pydantic import BaseModel, Field, model_validator
 
 
 class PolicyMode(enum.StrEnum):
@@ -66,21 +60,22 @@ class PolicyConfig(BaseModel):
         ...,
         description="Scheduling mode: 'spread' balances load, 'pack' consolidates.",
     )
-    aggregate: str = Field(
-        ...,
-        min_length=1,
-        description="Nova host aggregate name. Migrations stay within this boundary.",
-    )
     weight: float = Field(
-        default=1.0,
-        gt=0.0,
-        le=10.0,
-        description="Relative weight when combining multiple policies for the same aggregate.",
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Relative weight when combining policies into the aggregate score. "
+            "Enabled policy weights in one file must sum to 1.0."
+        ),
     )
     imbalance_query: str = Field(
         ...,
         min_length=1,
-        description="PromQL query returning a per-host metric. Must produce a 'host' label.",
+        description=(
+            "PromQL query returning a per-host utilization ratio in [0, 1]. "
+            "Out-of-range values cause the policy to be skipped at runtime."
+        ),
     )
     vm_profile_query: str | None = Field(
         default=None,
@@ -108,10 +103,6 @@ class PolicyConfig(BaseModel):
         le=1.0,
         description="Imbalance threshold: (max - min) must exceed this to trigger action.",
     )
-    cooldown: timedelta = Field(
-        default=timedelta(minutes=10),
-        description="Minimum time between migrations for this policy.",
-    )
     capacity_query: str | None = Field(
         default=None,
         description="PromQL query for capacity check (required for 'pack' mode).",
@@ -128,27 +119,16 @@ class PolicyConfig(BaseModel):
         le=100,
         description="Maximum migrations the planner may propose per evaluation cycle.",
     )
-    min_sustained_minutes: int = Field(
-        default=0,
-        ge=0,
-        description="Imbalance must persist for this many consecutive evaluations before action.",
-    )
     enabled: bool = Field(
         default=True,
         description="Whether this policy is active.",
     )
-
-    @field_validator("cooldown", mode="before")
-    @classmethod
-    def _parse_cooldown(cls, v: Any) -> timedelta:
-        return parse_duration(v)
 
     @model_validator(mode="after")
     def _pack_requires_capacity_query(self) -> Self:
         if self.mode == PolicyMode.PACK and not self.capacity_query:
             raise ValueError("'pack' mode requires a capacity_query.")
         return self
-
 
 
 class PoliciesConfig(BaseModel):
@@ -167,5 +147,33 @@ class PoliciesConfig(BaseModel):
         if duplicates:
             raise ValueError(
                 f"Duplicate policy names: {', '.join(sorted(duplicates))}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _single_mode(self) -> Self:
+        """All policies in one file must share a mode.
+
+        Spread and pack are opposite intents (balance vs consolidate).
+        Deploy a separate engine with its own policies.yaml for the other mode.
+        """
+        modes = {p.mode for p in self.policies}
+        if len(modes) > 1:
+            sorted_modes = ", ".join(sorted(m.value for m in modes))
+            raise ValueError(
+                f"All policies in one file must share a mode; found: {sorted_modes}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enabled_weights_sum_to_one(self) -> Self:
+        """Enabled policies must have weights summing to 1.0."""
+        enabled = [p for p in self.policies if p.enabled]
+        if not enabled:
+            return self
+        total = sum(p.weight for p in enabled)
+        if not math.isclose(total, 1.0, abs_tol=1e-6):
+            raise ValueError(
+                f"Enabled policy weights must sum to 1.0; got {total:.6f}"
             )
         return self

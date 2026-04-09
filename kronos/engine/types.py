@@ -20,20 +20,21 @@ class HostScore:
 
 @dataclass
 class VmProfile:
-    """Resource profile for a single VM.
+    """Resource profile for a single VM across all policies.
 
-    The ``weight`` is the single number the planner uses for simulation.
-    It is dimension-agnostic: could represent CPU utilisation, memory
-    pressure, or any metric the policy's ``vm_profile_query`` returns.
-    When no Prometheus data is available, the fallback strategy fills
-    this value from Nova flavor data or host averages.
+    Each policy contributes one entry to ``weights`` with its own view of
+    this VM's resource footprint (memory RSS ratio, CPU rate ratio, etc.).
+    The planner simulates moves by subtracting ``weights[policy_name]`` from
+    the source host's score for that policy and adding it to the destination.
+    ``sources`` tracks whether the value came from Prometheus or a fallback
+    for debugging.
     """
 
     instance_uuid: str
     instance_name: str
     host: str
-    weight: float
-    source: str = "prometheus"
+    weights: dict[str, float] = field(default_factory=dict)
+    sources: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -44,20 +45,19 @@ class MigrationStep:
     instance_name: str
     from_host: str
     to_host: str
-    weight: float
     improvement: float
 
 
 @dataclass
 class MigrationPlan:
-    """Ordered list of proposed migrations for a single policy evaluation.
+    """Ordered list of proposed migrations for a single aggregate cycle.
 
-    The planner produces this; in M2 it is only logged (dry-run).
-    In M3+ it will be published to oslo.messaging for the executor.
+    Covers all policies for the aggregate (combined scoring).  The engine
+    emits one plan per aggregate per cycle when imbalance is detected.
     """
 
-    policy_name: str
     aggregate: str
+    policy_names: list[str] = field(default_factory=list)
     steps: list[MigrationStep] = field(default_factory=list)
     initial_imbalance: float = 0.0
     projected_imbalance: float = 0.0
@@ -69,11 +69,10 @@ class MigrationPlan:
 
 @dataclass
 class PolicyResult:
-    """Result of evaluating a single policy."""
+    """Result of evaluating a single policy against an aggregate."""
 
     policy_name: str
     mode: PolicyMode
-    aggregate: str
     host_scores: list[HostScore]
     imbalance: float
     imbalance_detected: bool
@@ -81,6 +80,16 @@ class PolicyResult:
     evaluation_duration_ms: float
     skipped: bool = False
     skip_reason: str = ""
+
+
+@dataclass
+class AggregateResult:
+    """Combined result of evaluating all policies against an aggregate."""
+
+    aggregate: str
+    policy_results: list[PolicyResult] = field(default_factory=list)
+    combined_imbalance: float = 0.0
+    imbalance_detected: bool = False
     vm_profiles: dict[str, VmProfile] = field(default_factory=dict)
     migration_plan: MigrationPlan | None = None
 
@@ -92,29 +101,24 @@ class CycleReport:
     cycle_number: int
     started_at: datetime
     completed_at: datetime
-    policy_results: list[PolicyResult] = field(default_factory=list)
+    aggregate_results: list[AggregateResult] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     dry_run: bool = True
 
 
 @dataclass
 class MigrationTask:
-    """A single migration to execute, published by the engine to the executor.
-
-    The engine creates one task per ``MigrationStep`` in a plan.  Tasks
-    within the same plan share a ``plan_id``.  The ``not_before`` field
-    staggers execution so the executor doesn't fire all migrations at once.
-    """
+    """A single migration to execute, cast by the engine to the executor."""
 
     task_id: str
     plan_id: str
-    policy_name: str
     aggregate: str
+    policy_names: list[str]
     instance_uuid: str
     instance_name: str
     from_host: str
     to_host: str
-    weight: float
+    improvement: float
     priority: int = 5
     max_retries: int = 3
     retry_count: int = 0
@@ -125,8 +129,8 @@ class MigrationTask:
     def from_step(
         step: MigrationStep,
         plan_id: str,
-        policy_name: str,
         aggregate: str,
+        policy_names: list[str],
         not_before: float,
         max_retries: int = 3,
     ) -> MigrationTask:
@@ -134,13 +138,13 @@ class MigrationTask:
         return MigrationTask(
             task_id=str(uuid.uuid4()),
             plan_id=plan_id,
-            policy_name=policy_name,
             aggregate=aggregate,
+            policy_names=list(policy_names),
             instance_uuid=step.instance_uuid,
             instance_name=step.instance_name,
             from_host=step.from_host,
             to_host=step.to_host,
-            weight=step.weight,
+            improvement=step.improvement,
             not_before=not_before,
             max_retries=max_retries,
             created_at=datetime.now(tz=UTC).isoformat(),
@@ -151,13 +155,12 @@ class MigrationTask:
 class MigrationResult:
     """Outcome of a migration attempt, published by the executor.
 
-    Both active and passive engines listen for these to maintain
-    cooldown state.
+    Engines (active and passive) listen for these to update cooldown state.
     """
 
     task_id: str
     plan_id: str
-    policy_name: str
+    aggregate: str
     instance_uuid: str
     from_host: str
     to_host: str

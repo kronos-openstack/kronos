@@ -77,6 +77,34 @@ engine_opts = [
         default=900,
         help="Seconds after a VM is included in a plan before it can be re-planned.",
     ),
+    cfg.IntOpt(
+        "cooldown",
+        default=600,
+        help=(
+            "Seconds after a plan is emitted for an aggregate before another "
+            "plan can be emitted for the same aggregate."
+        ),
+    ),
+    cfg.ListOpt(
+        "aggregates",
+        default=[],
+        help=(
+            "Nova host aggregate names this engine manages. Each listed "
+            "aggregate is planned independently; migrations stay within "
+            "aggregate boundaries."
+        ),
+    ),
+    cfg.BoolOpt(
+        "include_unassigned_hosts",
+        default=True,
+        help=(
+            "Also manage compute hosts that belong to no Nova host aggregate. "
+            "In Nova, aggregate membership is optional — hosts outside any "
+            "aggregate form an ungrouped pool. With this enabled, the engine "
+            "treats that pool as an independent planning scope: migrations "
+            "stay within the pool and never cross into a named aggregate."
+        ),
+    ),
 ]
 
 prometheus_opts = [

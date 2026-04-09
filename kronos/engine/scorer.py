@@ -7,9 +7,7 @@ from datetime import UTC, datetime
 
 from oslo_log import log as logging
 
-from kronos.clients.nova import NovaClient
 from kronos.clients.prometheus import PrometheusClient
-from kronos.common.exceptions import PolicyEvaluationError
 from kronos.engine.types import HostScore, PolicyResult
 from kronos.policies.models import PolicyConfig
 
@@ -17,57 +15,38 @@ LOG = logging.getLogger(__name__)
 
 
 class PolicyScorer:
-    """Evaluates a single policy's PromQL queries and produces host scores.
+    """Evaluates a single policy's PromQL imbalance query against a set of hosts.
 
-    Steps:
-      1. Get hosts in the policy's aggregate from Nova
-      2. Query Prometheus with imbalance_query
-      3. Match results to Nova hosts
-      4. Normalize scores within the aggregate
-      5. Detect imbalance
+    The engine resolves the aggregate → host list and hands it to the
+    scorer.  The scorer runs the PromQL query, matches results to the
+    host list, normalises the values, enforces the [0, 1] contract, and
+    detects imbalance.
     """
 
-    def __init__(
-        self,
-        prometheus: PrometheusClient,
-        nova: NovaClient,
-    ) -> None:
+    def __init__(self, prometheus: PrometheusClient) -> None:
         self._prometheus = prometheus
-        self._nova = nova
 
-    def evaluate(self, policy: PolicyConfig) -> PolicyResult:
-        """Evaluate a policy and return scored hosts.
+    def evaluate(
+        self,
+        policy: PolicyConfig,
+        hosts: list[str],
+    ) -> PolicyResult:
+        """Evaluate a policy against a concrete host list.
 
         :param policy: The policy to evaluate.
+        :param hosts: The host set this evaluation is scoped to.
         :returns: PolicyResult with host scores and imbalance detection.
-        :raises PolicyEvaluationError: If evaluation fails.
         """
         start = time.monotonic()
         now = datetime.now(tz=UTC)
 
-        try:
-            aggregate_hosts = self._nova.get_aggregate_hosts(policy.aggregate)
-        except Exception as exc:
-            raise PolicyEvaluationError(
-                policy_name=policy.name,
-                reason=f"Failed to get aggregate hosts: {exc}",
-            ) from exc
-
-        if not aggregate_hosts:
-            return PolicyResult(
-                policy_name=policy.name,
-                mode=policy.mode,
-                aggregate=policy.aggregate,
-                host_scores=[],
-                imbalance=0.0,
-                imbalance_detected=False,
-                timestamp=now,
-                evaluation_duration_ms=(time.monotonic() - start) * 1000,
-                skipped=True,
-                skip_reason=f"Aggregate '{policy.aggregate}' has no hosts.",
+        if not hosts:
+            return self._skipped(
+                policy, now, start,
+                "No hosts in scope.",
             )
 
-        expected_hosts = set(aggregate_hosts)
+        expected_hosts = set(hosts)
         result = self._prometheus.instant_query(
             query=policy.imbalance_query,
             label_key=policy.host_label,
@@ -75,23 +54,12 @@ class PolicyScorer:
         )
 
         if not result.is_trustworthy:
-            return PolicyResult(
-                policy_name=policy.name,
-                mode=policy.mode,
-                aggregate=policy.aggregate,
-                host_scores=[],
-                imbalance=0.0,
-                imbalance_detected=False,
-                timestamp=now,
-                evaluation_duration_ms=(time.monotonic() - start) * 1000,
-                skipped=True,
-                skip_reason=(
-                    f"Untrustworthy data (health={result.health.value}): "
-                    f"{'; '.join(result.warnings)}"
-                ),
+            return self._skipped(
+                policy, now, start,
+                f"Untrustworthy data (health={result.health.value}): "
+                f"{'; '.join(result.warnings)}",
             )
 
-        # Filter to only hosts in the aggregate
         filtered = {
             host: score
             for host, score in result.series.items()
@@ -99,17 +67,26 @@ class PolicyScorer:
         }
 
         if not filtered:
-            return PolicyResult(
-                policy_name=policy.name,
-                mode=policy.mode,
-                aggregate=policy.aggregate,
-                host_scores=[],
-                imbalance=0.0,
-                imbalance_detected=False,
-                timestamp=now,
-                evaluation_duration_ms=(time.monotonic() - start) * 1000,
-                skipped=True,
-                skip_reason="No matching host data from Prometheus.",
+            return self._skipped(
+                policy, now, start,
+                "No matching host data from Prometheus.",
+            )
+
+        # Enforce the [0, 1] contract — the policy's imbalance_query must
+        # return utilization ratios, not absolute values.
+        out_of_range = {
+            h: v for h, v in filtered.items() if v < 0.0 or v > 1.0
+        }
+        if out_of_range:
+            LOG.error(
+                "Policy '%s': imbalance_query returned out-of-range values: %s. "
+                "Policy imbalance_query must yield values in [0, 1].",
+                policy.name,
+                out_of_range,
+            )
+            return self._skipped(
+                policy, now, start,
+                f"imbalance_query returned out-of-range values: {out_of_range}",
             )
 
         host_scores = self._normalize_scores(filtered)
@@ -119,9 +96,8 @@ class PolicyScorer:
         duration_ms = (time.monotonic() - start) * 1000
 
         LOG.info(
-            "Policy '%s' aggregate='%s': imbalance=%.3f threshold=%.3f detected=%s (%.1fms)",
+            "Policy '%s': imbalance=%.3f threshold=%.3f detected=%s (%.1fms)",
             policy.name,
-            policy.aggregate,
             imbalance,
             policy.threshold,
             imbalance_detected,
@@ -131,12 +107,30 @@ class PolicyScorer:
         return PolicyResult(
             policy_name=policy.name,
             mode=policy.mode,
-            aggregate=policy.aggregate,
             host_scores=host_scores,
             imbalance=imbalance,
             imbalance_detected=imbalance_detected,
             timestamp=now,
             evaluation_duration_ms=duration_ms,
+        )
+
+    @staticmethod
+    def _skipped(
+        policy: PolicyConfig,
+        now: datetime,
+        start: float,
+        reason: str,
+    ) -> PolicyResult:
+        return PolicyResult(
+            policy_name=policy.name,
+            mode=policy.mode,
+            host_scores=[],
+            imbalance=0.0,
+            imbalance_detected=False,
+            timestamp=now,
+            evaluation_duration_ms=(time.monotonic() - start) * 1000,
+            skipped=True,
+            skip_reason=reason,
         )
 
     @staticmethod

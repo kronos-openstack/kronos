@@ -1,4 +1,9 @@
-"""VM profile collection: maps Prometheus per-VM metrics to Nova instances."""
+"""VM profile collection: per-aggregate, across all policies.
+
+One profiler run builds a ``dict[uuid, VmProfile]`` for the aggregate with
+per-policy ``weights`` and ``sources`` dicts.  This is the data the planner
+uses to simulate combined-scoring moves.
+"""
 
 from __future__ import annotations
 
@@ -19,11 +24,12 @@ LOG = logging.getLogger(__name__)
 
 
 class VmProfiler:
-    """Collects per-VM resource profiles for planner simulation.
+    """Collects per-VM resource profiles across all policies for an aggregate.
 
-    Queries ``vm_profile_query`` from Prometheus, maps the results to
-    Nova instances using ``vm_profile_label_type``, and applies fallback
-    strategies for VMs without Prometheus data.
+    Each policy contributes its own view of each VM (memory RSS ratio, CPU
+    rate ratio, etc.).  VMs without Prometheus data for a given policy fall
+    back per that policy's ``vm_profile_fallback`` setting; a VM may end up
+    with data from some policies and fallback from others.
     """
 
     def __init__(
@@ -36,77 +42,87 @@ class VmProfiler:
 
     def collect(
         self,
-        policy: PolicyConfig,
-        aggregate_hosts: list[str],
-        host_scores: dict[str, float],
+        policies: list[PolicyConfig],
+        hosts: list[str],
+        host_scores_by_policy: dict[str, dict[str, float]],
     ) -> dict[str, VmProfile]:
-        """Collect VM profiles for all instances in the aggregate.
+        """Collect VM profiles for all instances on the aggregate's hosts.
 
-        :param policy: Policy with vm_profile_query and mapping config.
-        :param aggregate_hosts: Hostnames in the policy's aggregate.
-        :param host_scores: Raw per-host scores from imbalance_query.
-        :returns: Mapping of instance UUID to VmProfile.
+        :param policies: Enabled policies for this aggregate.
+        :param hosts: Hostnames in the aggregate.
+        :param host_scores_by_policy: ``{policy_name: {host: raw_score}}``
+            (used by fallback strategies).
+        :returns: Mapping of instance UUID → VmProfile (with per-policy weights).
         """
-        instances = self._collect_instances(aggregate_hosts)
+        instances = self._collect_instances(hosts)
         if not instances:
-            LOG.warning(
-                "Policy '%s': no instances found on aggregate hosts.",
-                policy.name,
-            )
+            LOG.warning("No instances found on hosts %s", hosts)
             return {}
 
-        # Count VMs per host for HOST_AVERAGE fallback
         vms_per_host: Counter[str] = Counter(i.host for i in instances)
 
-        # Query Prometheus for per-VM metrics
-        prom_profiles: dict[str, float] = {}
-        if policy.vm_profile_query:
-            prom_profiles = self._query_vm_profiles(
-                policy.vm_profile_query,
-                policy.vm_profile_label,
-            )
+        # Query Prometheus once per policy that has a vm_profile_query
+        prom_results: dict[str, dict[str, float]] = {}
+        for policy in policies:
+            if policy.vm_profile_query:
+                prom_results[policy.name] = self._query_vm_profiles(
+                    policy.vm_profile_query,
+                    policy.vm_profile_label,
+                )
+            else:
+                prom_results[policy.name] = {}
 
         profiles: dict[str, VmProfile] = {}
         for instance in instances:
-            prom_key = _instance_prom_key(instance, policy.vm_profile_label_type)
-            weight: float | None = prom_profiles.get(prom_key)
-            source = "prometheus"
+            weights: dict[str, float] = {}
+            sources: dict[str, str] = {}
+            drop = False
 
-            if weight is None:
-                weight = _apply_fallback(
-                    instance=instance,
-                    fallback=policy.vm_profile_fallback,
-                    host_scores=host_scores,
-                    vms_per_host=vms_per_host,
-                )
-                source = f"fallback:{policy.vm_profile_fallback.value}"
+            for policy in policies:
+                prom_key = _instance_prom_key(instance, policy.vm_profile_label_type)
+                raw = prom_results[policy.name].get(prom_key)
+                source = "prometheus"
 
-            if weight is None:
+                if raw is None:
+                    raw = _apply_fallback(
+                        instance=instance,
+                        fallback=policy.vm_profile_fallback,
+                        host_scores=host_scores_by_policy.get(policy.name, {}),
+                        vms_per_host=vms_per_host,
+                    )
+                    source = f"fallback:{policy.vm_profile_fallback.value}"
+
+                if raw is None:
+                    # Policy says SKIP and no Prometheus data: drop this VM
+                    # from the combined profile entirely.
+                    drop = True
+                    break
+
+                weights[policy.name] = raw
+                sources[policy.name] = source
+
+            if drop:
                 continue
 
             profiles[instance.uuid] = VmProfile(
                 instance_uuid=instance.uuid,
                 instance_name=instance.name,
                 host=instance.host,
-                weight=weight,
-                source=source,
+                weights=weights,
+                sources=sources,
             )
 
         LOG.info(
-            "Policy '%s': collected %d VM profiles (%d instances total).",
-            policy.name,
+            "Collected %d VM profiles (%d instances total, %d policies).",
             len(profiles),
             len(instances),
+            len(policies),
         )
         return profiles
 
-    def _collect_instances(
-        self,
-        aggregate_hosts: list[str],
-    ) -> list[Instance]:
-        """Fetch all instances across aggregate hosts."""
+    def _collect_instances(self, hosts: list[str]) -> list[Instance]:
         instances: list[Instance] = []
-        for host in aggregate_hosts:
+        for host in hosts:
             instances.extend(self._nova.list_instances_on_host(host))
         return instances
 
@@ -115,11 +131,6 @@ class VmProfiler:
         query: str,
         label_key: str,
     ) -> dict[str, float]:
-        """Query Prometheus for per-VM metrics.
-
-        Returns a mapping from label value to metric value.
-        No expected_labels check — partial VM data is normal.
-        """
         result = self._prometheus.instant_query(
             query=query,
             label_key=label_key,
@@ -148,26 +159,16 @@ def _apply_fallback(
     host_scores: dict[str, float],
     vms_per_host: Counter[str],
 ) -> float | None:
-    """Apply fallback strategy for VMs without Prometheus data.
-
-    :param instance: The Nova instance.
-    :param fallback: Which fallback strategy to use.
-    :param host_scores: Raw per-host scores from imbalance_query.
-    :param vms_per_host: Count of VMs per host.
-    :returns: Estimated weight, or None if the VM should be skipped.
-    """
+    """Apply fallback strategy for VMs without Prometheus data."""
     if fallback == VmProfileFallback.SKIP:
         return None
 
     if fallback == VmProfileFallback.FLAVOR_VCPU_RATIO:
-        # Estimate weight proportional to VM's vCPU share of the host.
-        # Use the host's score * (VM vCPUs / total vCPUs on host) as proxy.
         host_score = host_scores.get(instance.host, 0.0)
         vm_count = vms_per_host.get(instance.host, 1)
         return host_score * instance.flavor_vcpus / max(instance.flavor_vcpus * vm_count, 1)
 
     if fallback == VmProfileFallback.HOST_AVERAGE:
-        # Assume each VM contributes equally to the host's score.
         host_score = host_scores.get(instance.host, 0.0)
         vm_count = vms_per_host.get(instance.host, 1)
         return host_score / max(vm_count, 1)

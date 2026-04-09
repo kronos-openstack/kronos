@@ -148,18 +148,22 @@ class NovaClient:
                 return agg
         raise AggregateNotFound(aggregate=aggregate_name)
 
-    def get_aggregate_hosts(self, aggregate_name: str) -> list[str]:
-        """Get hostnames in a specific aggregate.
+    def get_hosts_in_aggregate(
+        self, aggregate_name: str | None,
+    ) -> list[str]:
+        """Get hostnames for an aggregate or for the unassigned pool.
 
-        If ``aggregate_name`` is ``"_all"``, returns all compute host names
-        (useful for clusters with no aggregates defined).
-
-        :param aggregate_name: Name of the aggregate, or ``"_all"`` for all hosts.
+        :param aggregate_name: Name of the aggregate, or ``None`` to get
+            compute hypervisors that are not members of any aggregate.
         :returns: List of hostnames.
-        :raises AggregateNotFound: If the aggregate does not exist.
+        :raises AggregateNotFound: If a named aggregate does not exist.
         """
-        if aggregate_name == "_all":
-            return [h.name for h in self.list_compute_hosts()]
+        if aggregate_name is None:
+            all_hosts = {h.name for h in self.list_compute_hosts()}
+            assigned: set[str] = set()
+            for agg in self.list_aggregates():
+                assigned.update(agg.hosts)
+            return sorted(all_hosts - assigned)
         agg = self.get_aggregate(aggregate_name)
         return agg.hosts
 
@@ -197,7 +201,7 @@ class NovaClient:
         ]
 
         if aggregate_name:
-            agg_hosts = set(self.get_aggregate_hosts(aggregate_name))
+            agg_hosts = set(self.get_hosts_in_aggregate(aggregate_name))
             hosts = [h for h in hosts if h.name in agg_hosts]
 
         return hosts

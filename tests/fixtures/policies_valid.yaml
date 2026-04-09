@@ -1,7 +1,6 @@
 policies:
   - name: gpu-cpu-spread
     mode: spread
-    aggregate: gpu-aggregate
     weight: 0.6
     imbalance_query: |
       avg by (host) (
@@ -9,12 +8,10 @@ policies:
       )
     host_label: host
     threshold: 0.15
-    cooldown: 10m
     max_migrations_per_cycle: 3
 
   - name: std-memory-spread
     mode: spread
-    aggregate: standard-aggregate
     weight: 0.4
     imbalance_query: |
       avg by (host) (
@@ -22,6 +19,4 @@ policies:
         / libvirt_domain_info_maximum_memory_bytes
       )
     threshold: 0.20
-    cooldown: 15m
     max_migrations_per_cycle: 5
-    enabled: false

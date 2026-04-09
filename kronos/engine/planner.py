@@ -1,12 +1,16 @@
-"""Migration planning: simulation-based VM placement decisions.
+"""Migration planning with combined multi-policy scoring.
 
-The planner takes scored hosts and VM profiles, then simulates moves
-to find an optimal set of migrations that reduce imbalance (spread)
-or consolidate workloads (pack).
+The planner receives all enabled policies for an aggregate plus a unified
+set of VM profiles (each VM carries per-policy weights).  It simulates
+candidate moves against every policy's scores simultaneously, picking
+moves that reduce the weighted combined imbalance without pushing any
+individual policy's imbalance above its own threshold.
 
-This module is a pure planner — it never calls Nova migrate.  In M2
-it produces ``MigrationPlan`` objects that are logged (dry-run).  In
-M3+ plans will be published to oslo.messaging for the executor.
+Two strategies:
+
+* **spread**: greedy best-move-per-round, minimising the combined imbalance
+* **pack**: First Fit Decreasing, using combined utilization for host
+  ordering and each policy's ``capacity_threshold`` as a ceiling
 """
 
 from __future__ import annotations
@@ -15,9 +19,9 @@ from oslo_log import log as logging
 
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.types import (
-    HostScore,
     MigrationPlan,
     MigrationStep,
+    PolicyResult,
     VmProfile,
 )
 from kronos.policies.models import PolicyConfig, PolicyMode
@@ -25,115 +29,135 @@ from kronos.policies.models import PolicyConfig, PolicyMode
 LOG = logging.getLogger(__name__)
 
 
-class Planner:
-    """Produces migration plans by simulating VM moves.
+# Per-policy score state: {policy_name: {host: score}}
+PolicyScores = dict[str, dict[str, float]]
 
-    Delegates to mode-specific strategies: greedy simulation for
-    spread, First Fit Decreasing for pack.
-    """
+
+class Planner:
+    """Produces combined-scoring migration plans."""
 
     def __init__(self, constraints: ConstraintChecker) -> None:
         self._constraints = constraints
 
     def plan(
         self,
-        policy: PolicyConfig,
-        host_scores: list[HostScore],
+        aggregate: str,
+        policies: list[PolicyConfig],
+        policy_results: list[PolicyResult],
         vm_profiles: dict[str, VmProfile],
     ) -> MigrationPlan:
-        """Generate a migration plan for the given policy.
+        """Generate a combined-scoring migration plan for an aggregate.
 
-        :param policy: The policy being evaluated.
-        :param host_scores: Scored hosts (sorted descending by raw_score).
-        :param vm_profiles: Per-VM profiles keyed by instance UUID.
+        :param aggregate: Aggregate name (for the plan metadata).
+        :param policies: All enabled policies for this aggregate.
+        :param policy_results: Scorer results for the same policies, in
+            the same order.
+        :param vm_profiles: Keyed by instance UUID; each profile has
+            per-policy ``weights`` for every policy in ``policies``.
         :returns: MigrationPlan with proposed steps.
         """
-        if len(host_scores) < 2 or not vm_profiles:
+        if not policies or not vm_profiles:
             return MigrationPlan(
-                policy_name=policy.name,
-                aggregate=policy.aggregate,
+                aggregate=aggregate,
+                policy_names=[p.name for p in policies],
             )
 
-        if policy.mode == PolicyMode.SPREAD:
-            return self._plan_spread(policy, host_scores, vm_profiles)
-        if policy.mode == PolicyMode.PACK:
-            return self._plan_pack(policy, host_scores, vm_profiles)
+        # Drop skipped policies from the set the planner reasons about.
+        active: list[tuple[PolicyConfig, PolicyResult]] = [
+            (p, r) for p, r in zip(policies, policy_results, strict=True)
+            if not r.skipped and r.host_scores
+        ]
+        if not active:
+            return MigrationPlan(
+                aggregate=aggregate,
+                policy_names=[p.name for p in policies],
+            )
 
-        return MigrationPlan(
-            policy_name=policy.name,
-            aggregate=policy.aggregate,
+        active_policies = [p for p, _ in active]
+        scores: PolicyScores = {
+            p.name: {hs.host: hs.raw_score for hs in r.host_scores}
+            for p, r in active
+        }
+
+        mode = active_policies[0].mode
+        max_migrations = max(p.max_migrations_per_cycle for p in active_policies)
+
+        plan = MigrationPlan(
+            aggregate=aggregate,
+            policy_names=[p.name for p in active_policies],
+            initial_imbalance=_combined_imbalance(scores, active_policies),
         )
+
+        if mode == PolicyMode.SPREAD:
+            self._plan_spread(active_policies, scores, vm_profiles, max_migrations, plan)
+        elif mode == PolicyMode.PACK:
+            self._plan_pack(active_policies, scores, vm_profiles, max_migrations, plan)
+
+        plan.projected_imbalance = _combined_imbalance(scores, active_policies)
+        return plan
+
+    # --- Spread ---
 
     def _plan_spread(
         self,
-        policy: PolicyConfig,
-        host_scores: list[HostScore],
+        policies: list[PolicyConfig],
+        scores: PolicyScores,
         vm_profiles: dict[str, VmProfile],
-    ) -> MigrationPlan:
-        """Greedy spread planner.
+        max_migrations: int,
+        plan: MigrationPlan,
+    ) -> None:
+        """Greedy spread planner over combined scoring.
 
-        On each iteration:
-          1. Pick the hottest host as source.
-          2. Pick the coldest host as destination.
-          3. Try each VM on the source, simulate the move.
-          4. Accept the move that yields the best imbalance reduction.
-          5. Repeat up to ``max_migrations_per_cycle``.
+        Each round picks the single best-improving (vm, source, dest)
+        triple.  Stops when every policy's imbalance is below threshold,
+        ``max_migrations`` is reached, or no improving move exists.
         """
-        # Build mutable score state: host -> current simulated score
-        scores = {hs.host: hs.raw_score for hs in host_scores}
-        # Group VM profiles by host
         vms_by_host = _group_vms_by_host(vm_profiles)
 
-        plan = MigrationPlan(
-            policy_name=policy.name,
-            aggregate=policy.aggregate,
-            initial_imbalance=_imbalance(scores),
-        )
-
-        for _ in range(policy.max_migrations_per_cycle):
-            current_imbalance = _imbalance(scores)
-            if current_imbalance <= policy.threshold:
+        for _ in range(max_migrations):
+            if _all_policies_happy(scores, policies):
                 break
 
             best = self._find_best_spread_move(
-                scores, vms_by_host, policy, current_imbalance,
+                policies, scores, vms_by_host,
             )
             if best is None:
                 break
 
             step, new_scores = best
             plan.steps.append(step)
-
-            # Apply the move to simulation state
-            scores = new_scores
+            _apply_move_to_scores(scores, new_scores)
             _move_vm_between_hosts(vms_by_host, step)
-
-        plan.projected_imbalance = _imbalance(scores)
-        return plan
 
     def _find_best_spread_move(
         self,
-        scores: dict[str, float],
+        policies: list[PolicyConfig],
+        scores: PolicyScores,
         vms_by_host: dict[str, list[VmProfile]],
-        policy: PolicyConfig,
-        current_imbalance: float,
-    ) -> tuple[MigrationStep, dict[str, float]] | None:
-        """Find the single best VM move that reduces imbalance the most."""
+    ) -> tuple[MigrationStep, PolicyScores] | None:
+        """Find the single best move minimising combined imbalance.
+
+        A candidate move is rejected if it would make any individual
+        policy worse than it currently is while also being above that
+        policy's own threshold.  This allows trade-offs between
+        dimensions (e.g. a small CPU cost to fix a large memory
+        imbalance) but never pushes a previously-OK policy into
+        violation, or worsens an already-violating policy further.
+        """
+        current_combined = _combined_imbalance(scores, policies)
         best_step: MigrationStep | None = None
-        best_scores: dict[str, float] | None = None
+        best_scores: PolicyScores | None = None
         best_improvement = 0.0
 
-        # Source: hottest host (highest score)
-        sorted_hosts = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        all_hosts = list(scores[policies[0].name].keys())
 
-        for source_host, _ in sorted_hosts:
+        for source_host in all_hosts:
             source_vms = vms_by_host.get(source_host, [])
             if not source_vms:
                 continue
 
             for vm in source_vms:
-                # Try each host as destination (coldest first)
-                for dest_host, _ in reversed(sorted_hosts):
+                for dest_host in all_hosts:
                     if dest_host == source_host:
                         continue
 
@@ -141,8 +165,12 @@ class Planner:
                         continue
 
                     simulated = _simulate_move(scores, vm, source_host, dest_host)
-                    new_imbalance = _imbalance(simulated)
-                    improvement = current_imbalance - new_imbalance
+
+                    if _move_hurts_any_policy(scores, simulated, policies):
+                        continue
+
+                    new_combined = _combined_imbalance(simulated, policies)
+                    improvement = current_combined - new_combined
 
                     if improvement > best_improvement:
                         best_improvement = improvement
@@ -152,7 +180,6 @@ class Planner:
                             instance_name=vm.instance_name,
                             from_host=source_host,
                             to_host=dest_host,
-                            weight=vm.weight,
                             improvement=improvement,
                         )
 
@@ -160,68 +187,59 @@ class Planner:
             return None
         return best_step, best_scores
 
+    # --- Pack ---
+
     def _plan_pack(
         self,
-        policy: PolicyConfig,
-        host_scores: list[HostScore],
+        policies: list[PolicyConfig],
+        scores: PolicyScores,
         vm_profiles: dict[str, VmProfile],
-    ) -> MigrationPlan:
-        """First Fit Decreasing bin-pack planner.
+        max_migrations: int,
+        plan: MigrationPlan,
+    ) -> None:
+        """First Fit Decreasing pack planner over combined scoring.
 
-        Goal: consolidate VMs into the fewest hosts possible.
-        No drain threshold — the emptiest hosts are drained first.
-
-        Algorithm:
-          1. Sort hosts ascending by utilisation (emptiest first = drain order).
-          2. For each drain candidate, collect its VMs sorted biggest-first.
-          3. For each VM, find the fullest non-source host where
-             score + weight <= ``capacity_threshold``.
-          4. Stop when ``max_migrations_per_cycle`` is reached or no
-             more moves are possible.
-
-        Hosts being drained are tracked so VMs are never moved *to* them.
+        Host ordering uses the combined weighted score.  A candidate
+        destination must not breach any policy's ``capacity_threshold``.
         """
-        scores = {hs.host: hs.raw_score for hs in host_scores}
         vms_by_host = _group_vms_by_host(vm_profiles)
 
-        plan = MigrationPlan(
-            policy_name=policy.name,
-            aggregate=policy.aggregate,
-            initial_imbalance=_imbalance(scores),
-        )
-
-        # Hosts we are draining — never send VMs to these
-        draining: set[str] = set()
-
-        # Snapshot which VMs each host originally owns.  VMs that
-        # land on a host via a migration in this cycle must NOT be
-        # drained again — only the original residents are candidates.
+        # Snapshot of original residents — only original VMs are drained.
         original_vms_by_host: dict[str, list[VmProfile]] = {
             host: list(vms) for host, vms in vms_by_host.items()
         }
 
-        # Process hosts coldest-first (by initial score)
-        sorted_hosts = sorted(scores.items(), key=lambda x: x[1])
+        draining: set[str] = set()
+
+        # Coldest-first by combined score
+        all_hosts = list(scores[policies[0].name].keys())
+        sorted_hosts = sorted(
+            all_hosts,
+            key=lambda h: _combined_host_score(scores, policies, h),
+        )
 
         migrations_done = 0
-        for source_host, _ in sorted_hosts:
-            if migrations_done >= policy.max_migrations_per_cycle:
+        for source_host in sorted_hosts:
+            if migrations_done >= max_migrations:
                 break
 
             source_vms = list(original_vms_by_host.get(source_host, []))
             if not source_vms:
                 continue
 
-            # Try to empty this host — biggest VMs first
-            source_vms.sort(key=lambda v: v.weight, reverse=True)
+            # Biggest combined-weight VMs first
+            source_vms.sort(
+                key=lambda v: _combined_vm_weight(v, policies),
+                reverse=True,
+            )
             draining.add(source_host)
 
             for vm in source_vms:
-                if migrations_done >= policy.max_migrations_per_cycle:
+                if migrations_done >= max_migrations:
                     break
 
                 dest = self._find_pack_destination(
-                    scores, vm, draining, vms_by_host, policy,
+                    policies, scores, vm, draining, vms_by_host,
                 )
                 if dest is None:
                     continue
@@ -231,41 +249,41 @@ class Planner:
                     instance_name=vm.instance_name,
                     from_host=source_host,
                     to_host=dest,
-                    weight=vm.weight,
                     improvement=0.0,
                 )
                 plan.steps.append(step)
 
-                scores = _simulate_move(scores, vm, source_host, dest)
+                new_scores = _simulate_move(scores, vm, source_host, dest)
+                _apply_move_to_scores(scores, new_scores)
                 _move_vm_between_hosts(vms_by_host, step)
                 migrations_done += 1
 
-        plan.projected_imbalance = _imbalance(scores)
-        return plan
-
     def _find_pack_destination(
         self,
-        scores: dict[str, float],
+        policies: list[PolicyConfig],
+        scores: PolicyScores,
         vm: VmProfile,
         draining: set[str],
         vms_by_host: dict[str, list[VmProfile]],
-        policy: PolicyConfig,
     ) -> str | None:
-        """Find the fullest non-draining host that can fit the VM.
-
-        Candidates are sorted fullest-first.  A host qualifies if
-        ``score + vm.weight <= capacity_threshold`` and it passes
-        constraint checks.
-        """
+        """Fullest non-draining host that fits within every policy's capacity."""
+        all_hosts = list(scores[policies[0].name].keys())
         candidates = sorted(
-            ((h, s) for h, s in scores.items() if h not in draining and h != vm.host),
-            key=lambda x: x[1],
+            (h for h in all_hosts if h not in draining and h != vm.host),
+            key=lambda h: _combined_host_score(scores, policies, h),
             reverse=True,
         )
 
-        for host, score in candidates:
-            if score + vm.weight > policy.capacity_threshold:
+        for host in candidates:
+            fits = True
+            for policy in policies:
+                projected = scores[policy.name][host] + vm.weights.get(policy.name, 0.0)
+                if projected > policy.capacity_threshold:
+                    fits = False
+                    break
+            if not fits:
                 continue
+
             if not self._constraints.check(vm, host, vms_by_host):
                 continue
             return host
@@ -273,13 +291,98 @@ class Planner:
         return None
 
 
-# --- Simulation helpers (module-level, stateless) ---
+# --- Helpers ---
+
+
+def _combined_imbalance(
+    scores: PolicyScores,
+    policies: list[PolicyConfig],
+) -> float:
+    """Weighted sum of per-policy (max - min) imbalance values."""
+    total = 0.0
+    for policy in policies:
+        host_scores = scores[policy.name]
+        if len(host_scores) < 2:
+            continue
+        values = host_scores.values()
+        total += policy.weight * (max(values) - min(values))
+    return total
+
+
+def _all_policies_happy(
+    scores: PolicyScores,
+    policies: list[PolicyConfig],
+) -> bool:
+    """True when every policy's imbalance is at or below its threshold."""
+    for policy in policies:
+        host_scores = scores[policy.name]
+        if len(host_scores) < 2:
+            continue
+        imbalance = max(host_scores.values()) - min(host_scores.values())
+        if imbalance > policy.threshold:
+            return False
+    return True
+
+
+def _policy_imbalance(
+    scores: PolicyScores,
+    policy_name: str,
+) -> float:
+    """Return the current (max - min) imbalance for one policy."""
+    host_scores = scores[policy_name]
+    if len(host_scores) < 2:
+        return 0.0
+    return max(host_scores.values()) - min(host_scores.values())
+
+
+def _move_hurts_any_policy(
+    before: PolicyScores,
+    after: PolicyScores,
+    policies: list[PolicyConfig],
+) -> bool:
+    """True if the move worsens any policy while leaving it above threshold.
+
+    A move is allowed to slightly worsen a policy as long as it stays
+    below that policy's threshold; and it is always allowed to improve
+    or leave a policy unchanged.  It is only rejected when both:
+
+    * the policy's imbalance increases, AND
+    * the new imbalance is above the policy's threshold
+    """
+    for policy in policies:
+        before_val = _policy_imbalance(before, policy.name)
+        after_val = _policy_imbalance(after, policy.name)
+        if after_val > before_val and after_val > policy.threshold:
+            return True
+    return False
+
+
+def _combined_host_score(
+    scores: PolicyScores,
+    policies: list[PolicyConfig],
+    host: str,
+) -> float:
+    """Weighted sum of per-policy scores for a single host."""
+    return sum(
+        policy.weight * scores[policy.name].get(host, 0.0)
+        for policy in policies
+    )
+
+
+def _combined_vm_weight(
+    vm: VmProfile,
+    policies: list[PolicyConfig],
+) -> float:
+    """Weighted sum of per-policy VM weights."""
+    return sum(
+        policy.weight * vm.weights.get(policy.name, 0.0)
+        for policy in policies
+    )
 
 
 def _group_vms_by_host(
     vm_profiles: dict[str, VmProfile],
 ) -> dict[str, list[VmProfile]]:
-    """Group VM profiles by their current host."""
     by_host: dict[str, list[VmProfile]] = {}
     for vm in vm_profiles.values():
         by_host.setdefault(vm.host, []).append(vm)
@@ -287,24 +390,29 @@ def _group_vms_by_host(
 
 
 def _simulate_move(
-    scores: dict[str, float],
+    scores: PolicyScores,
     vm: VmProfile,
     from_host: str,
     to_host: str,
-) -> dict[str, float]:
-    """Return new score state after moving a VM."""
-    new_scores = dict(scores)
-    new_scores[from_host] = new_scores.get(from_host, 0.0) - vm.weight
-    new_scores[to_host] = new_scores.get(to_host, 0.0) + vm.weight
+) -> PolicyScores:
+    """Return a new per-policy score state reflecting a VM move."""
+    new_scores: PolicyScores = {}
+    for policy_name, host_scores in scores.items():
+        weight = vm.weights.get(policy_name, 0.0)
+        updated = dict(host_scores)
+        updated[from_host] = updated.get(from_host, 0.0) - weight
+        updated[to_host] = updated.get(to_host, 0.0) + weight
+        new_scores[policy_name] = updated
     return new_scores
 
 
-def _imbalance(scores: dict[str, float]) -> float:
-    """Compute imbalance as (max - min) of scores."""
-    if len(scores) < 2:
-        return 0.0
-    values = list(scores.values())
-    return max(values) - min(values)
+def _apply_move_to_scores(
+    scores: PolicyScores,
+    new_scores: PolicyScores,
+) -> None:
+    """Replace the contents of ``scores`` in place with ``new_scores``."""
+    for policy_name, host_scores in new_scores.items():
+        scores[policy_name] = host_scores
 
 
 def _move_vm_between_hosts(

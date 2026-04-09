@@ -15,7 +15,7 @@ class TestLoadPolicies:
         assert config.policies[0].name == "gpu-cpu-spread"
         assert config.policies[0].enabled is True
         assert config.policies[1].name == "std-memory-spread"
-        assert config.policies[1].enabled is False
+        assert config.policies[1].enabled is True
 
     def test_load_invalid_duplicate_names(self, invalid_policies_path):
         with pytest.raises(PolicyValidationError, match="Duplicate policy names"):
@@ -51,7 +51,6 @@ class TestLoadPolicies:
     def test_policy_field_values(self, valid_policies_path):
         config = load_policies(valid_policies_path)
         gpu_policy = config.policies[0]
-        assert gpu_policy.aggregate == "gpu-aggregate"
         assert gpu_policy.weight == 0.6
         assert gpu_policy.threshold == 0.15
         assert gpu_policy.max_migrations_per_cycle == 3

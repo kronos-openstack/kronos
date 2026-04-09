@@ -47,10 +47,9 @@ def sample_policy_dict() -> dict:
     return {
         "name": "test-policy",
         "mode": "spread",
-        "aggregate": "test-aggregate",
+        "weight": 1.0,
         "imbalance_query": "up",
         "threshold": 0.15,
-        "cooldown": "10m",
     }
 
 
@@ -60,11 +59,10 @@ def sample_pack_policy_dict() -> dict:
     return {
         "name": "test-pack-policy",
         "mode": "pack",
-        "aggregate": "test-aggregate",
+        "weight": 1.0,
         "imbalance_query": "up",
         "capacity_query": "capacity_metric",
         "threshold": 0.10,
-        "cooldown": "5m",
         "capacity_threshold": 0.80,
     }
 
