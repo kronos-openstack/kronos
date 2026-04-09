@@ -1,8 +1,17 @@
-"""oslo.messaging transport and notifier helpers.
+"""oslo.messaging transport, RPC, and notifier helpers.
 
-Provides factory functions for creating oslo.messaging transports and
-notifiers, plus serialization helpers for MigrationTask/MigrationResult
-dataclasses.
+Two message flows:
+
+- **Engine → Executor**: RPC cast (exactly-one delivery, competing consumers
+  semantics). Work queue — we want one executor to pick up each migration
+  task, not broadcast.
+- **Executor → Engine(s)**: Notifications (broadcast, multiple listeners).
+  Both active and passive engines subscribe to keep cooldown state warm.
+
+Two transports because oslo.messaging uses separate transport instances
+for RPC vs notifications.  They read the same ``transport_url``, but
+notifications can override via ``[oslo_messaging_notifications]
+transport_url`` if desired.
 """
 
 from __future__ import annotations
@@ -19,72 +28,133 @@ from kronos.common.config import MESSAGING_GROUP
 LOG = logging.getLogger(__name__)
 
 
-def get_transport(conf: cfg.ConfigOpts) -> oslo_messaging.Transport:
-    """Create an oslo.messaging notification transport.
+def get_rpc_transport(conf: cfg.ConfigOpts) -> oslo_messaging.Transport:
+    """Create an oslo.messaging RPC transport (for engine→executor)."""
+    url = conf[MESSAGING_GROUP].transport_url
+    return oslo_messaging.get_rpc_transport(conf, url=url)
 
-    :param conf: oslo.config with ``[messaging]`` group registered.
-    :returns: Transport instance.
-    :raises: oslo_messaging.TransportDriverError if transport_url is invalid.
-    """
+
+def get_notification_transport(
+    conf: cfg.ConfigOpts,
+) -> oslo_messaging.Transport:
+    """Create an oslo.messaging notification transport (for executor→engine)."""
     url = conf[MESSAGING_GROUP].transport_url
     return oslo_messaging.get_notification_transport(conf, url=url)
 
 
-def get_notifier(
-    transport: oslo_messaging.Transport,
-    topic: str,
-    publisher_id: str | None = None,
-) -> oslo_messaging.Notifier:
-    """Create an oslo.messaging Notifier for a specific topic.
+# --- RPC (engine → executor) ---
 
-    :param transport: oslo.messaging transport.
-    :param topic: Notification topic (e.g. ``kronos.migrations.gpu-aggregate``).
-    :param publisher_id: Publisher identifier. Defaults to ``kronos-engine``.
-    :returns: Notifier instance.
+
+# Topic component used when an aggregate is the unassigned-hosts pool.
+# Picked to be invalid as a Nova aggregate name (dashes/colons aren't in
+# the aggregate name charset, and the leading underscore is unusual).
+UNASSIGNED_TOPIC_MARKER = "_unassigned_"
+
+
+def _topic_component(aggregate: str | None) -> str:
+    """Return the topic-safe identifier for an aggregate or the unassigned pool."""
+    return aggregate if aggregate is not None else UNASSIGNED_TOPIC_MARKER
+
+
+def migrations_topic(aggregate: str | None) -> str:
+    """Return the RPC topic for migration tasks.
+
+    >>> migrations_topic("gpu-aggregate")
+    'kronos.migrations.gpu-aggregate'
+    >>> migrations_topic(None)
+    'kronos.migrations._unassigned_'
     """
-    return oslo_messaging.Notifier(
-        transport,
-        publisher_id=publisher_id or "kronos-engine",
-        topics=[topic],
+    return f"kronos.migrations.{_topic_component(aggregate)}"
+
+
+def get_rpc_client(
+    transport: oslo_messaging.Transport,
+    aggregate: str | None,
+) -> oslo_messaging.RPCClient:
+    """Create an RPC client that casts migration tasks to an aggregate topic.
+
+    Pass ``None`` for the unassigned-hosts pool.  Uses ``cast()`` for
+    fire-and-forget delivery — the engine never waits for a response.
+    Exactly-one delivery via competing consumers.
+    """
+    target = oslo_messaging.Target(
+        topic=migrations_topic(aggregate),
+        version="1.0",
     )
+    return oslo_messaging.get_rpc_client(transport, target)
 
 
-def get_listener(
+def get_rpc_server(
     transport: oslo_messaging.Transport,
-    targets: list[oslo_messaging.Target],
+    aggregate: str | None,
     endpoints: list[object],
-) -> oslo_messaging.NotificationListenerBase:
-    """Create an oslo.messaging notification listener.
+) -> oslo_messaging.MessageHandlingServer:
+    """Create an RPC server that processes migration tasks for an aggregate.
 
-    :param transport: oslo.messaging transport.
-    :param targets: List of (topic, exchange) targets to subscribe to.
-    :param endpoints: List of endpoint objects with handler methods.
-    :returns: NotificationListener instance (call ``.start()`` to begin consuming).
+    Pass ``None`` for the unassigned-hosts pool.  One server per topic;
+    competing consumers share a single queue.
     """
-    return oslo_messaging.get_notification_listener(
+    target = oslo_messaging.Target(
+        topic=migrations_topic(aggregate),
+        server=f"kronos-executor-{_topic_component(aggregate)}",
+        version="1.0",
+    )
+    return oslo_messaging.get_rpc_server(
         transport,
-        targets,
+        target,
         endpoints,
         executor="threading",
     )
 
 
-def migrations_topic(aggregate: str) -> str:
-    """Return the migration task topic for an aggregate.
-
-    >>> migrations_topic("gpu-aggregate")
-    'kronos.migrations.gpu-aggregate'
-    """
-    return f"kronos.migrations.{aggregate}"
+# --- Notifications (executor → engine) ---
 
 
-def results_topic(aggregate: str) -> str:
-    """Return the migration results topic for an aggregate.
+def results_topic(aggregate: str | None) -> str:
+    """Return the notification topic for migration results.
 
     >>> results_topic("gpu-aggregate")
     'kronos.results.gpu-aggregate'
+    >>> results_topic(None)
+    'kronos.results._unassigned_'
     """
-    return f"kronos.results.{aggregate}"
+    return f"kronos.results.{_topic_component(aggregate)}"
+
+
+def get_notifier(
+    transport: oslo_messaging.Transport,
+    topic: str,
+    publisher_id: str,
+) -> oslo_messaging.Notifier:
+    """Create a Notifier for publishing migration results.
+
+    The ``messagingv2`` driver is selected explicitly.  Without it, Notifier
+    falls back to the ``noop`` driver and silently discards every call.
+    """
+    return oslo_messaging.Notifier(
+        transport,
+        publisher_id=publisher_id,
+        driver="messagingv2",
+        topics=[topic],
+    )
+
+
+def get_notification_listener(
+    transport: oslo_messaging.Transport,
+    topic: str,
+    endpoints: list[object],
+) -> oslo_messaging.MessageHandlingServer:
+    """Create a notification listener for an aggregate's results topic."""
+    target = oslo_messaging.Target(topic=topic)
+    return oslo_messaging.get_notification_listener(
+        transport,
+        [target],
+        endpoints,
+        executor="threading",
+    )
+
+
+# --- Serialization helpers (shared) ---
 
 
 def task_to_dict(task: object) -> dict[str, object]:
@@ -117,18 +187,3 @@ def dict_to_dataclass(cls: type, data: dict[str, object]) -> object:
         elif f.default_factory is not dataclasses.MISSING:
             kwargs[f.name] = f.default_factory()
     return cls(**kwargs)
-
-
-def emit_notification(
-    notifier: oslo_messaging.Notifier,
-    event_type: str,
-    payload: dict[str, object],
-) -> None:
-    """Publish a notification at INFO priority.
-
-    :param notifier: oslo.messaging Notifier.
-    :param event_type: Event type string (e.g. ``migration.requested``).
-    :param payload: Serialized payload dict.
-    """
-    notifier.info({}, event_type, payload)
-    LOG.debug("Published %s: %s", event_type, payload.get("task_id", ""))

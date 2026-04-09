@@ -16,13 +16,13 @@ def _make_task(**overrides: object) -> MigrationTask:
     defaults: dict[str, object] = {
         "task_id": "task-123",
         "plan_id": "plan-456",
-        "policy_name": "cpu-spread",
         "aggregate": "test-agg",
+        "policy_names": ["cpu-spread"],
         "instance_uuid": "uuid-abc",
         "instance_name": "vm-1",
         "from_host": "host-a",
         "to_host": "host-b",
-        "weight": 0.1,
+        "improvement": 0.1,
     }
     defaults.update(overrides)
     return MigrationTask(**defaults)

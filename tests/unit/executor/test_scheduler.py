@@ -16,13 +16,13 @@ def _make_task(
     return MigrationTask(
         task_id=task_id,
         plan_id="plan-1",
-        policy_name="test-policy",
         aggregate="test-agg",
+        policy_names=["test-policy"],
         instance_uuid="uuid-1",
         instance_name="vm-1",
         from_host="h1",
         to_host="h2",
-        weight=0.1,
+        improvement=0.1,
         not_before=not_before,
     )
 
@@ -31,7 +31,7 @@ def _make_result(task: MigrationTask, success: bool = True) -> MigrationResult:
     return MigrationResult(
         task_id=task.task_id,
         plan_id=task.plan_id,
-        policy_name=task.policy_name,
+        aggregate=task.aggregate,
         instance_uuid=task.instance_uuid,
         from_host=task.from_host,
         to_host=task.to_host,

@@ -1,12 +1,16 @@
 """Entry point for ``kronos-executor``: migration execution daemon.
 
-Consumes migration tasks from the per-aggregate RabbitMQ topic and
-executes them via the Nova live-migrate API.
+Consumes migration tasks for one aggregate from RabbitMQ and executes
+them via the Nova live-migrate API.  One executor process per aggregate
+(or one for the unassigned-hosts pool).
 
 Usage::
 
     kronos-executor --config-file /etc/kronos/kronos.conf \\
                     --aggregate gpu-aggregate
+
+    kronos-executor --config-file /etc/kronos/kronos.conf \\
+                    --unassigned
 """
 
 from __future__ import annotations
@@ -33,8 +37,15 @@ def main() -> int:
     CONF.register_cli_opt(
         cfg.StrOpt(
             "aggregate",
-            required=True,
+            default=None,
             help="Nova host aggregate this executor handles.",
+        ),
+    )
+    CONF.register_cli_opt(
+        cfg.BoolOpt(
+            "unassigned",
+            default=False,
+            help="Handle the pool of hosts that are not members of any aggregate.",
         ),
     )
 
@@ -46,8 +57,20 @@ def main() -> int:
     )
     logging.setup(CONF, "kronos-executor")
 
-    aggregate = CONF.aggregate
-    LOG.info("kronos-executor starting for aggregate '%s'", aggregate)
+    if CONF.aggregate is None and not CONF.unassigned:
+        LOG.error(
+            "kronos-executor requires either --aggregate NAME or --unassigned.",
+        )
+        return 1
+    if CONF.aggregate is not None and CONF.unassigned:
+        LOG.error(
+            "kronos-executor: --aggregate and --unassigned are mutually exclusive.",
+        )
+        return 1
+
+    aggregate: str | None = None if CONF.unassigned else CONF.aggregate
+    label = aggregate if aggregate is not None else "<unassigned>"
+    LOG.info("kronos-executor starting for aggregate '%s'", label)
 
     worker = ExecutorWorker(CONF, aggregate)
 

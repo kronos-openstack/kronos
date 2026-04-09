@@ -64,7 +64,7 @@ class MigrationRunner:
             return MigrationResult(
                 task_id=task.task_id,
                 plan_id=task.plan_id,
-                policy_name=task.policy_name,
+                aggregate=task.aggregate,
                 instance_uuid=task.instance_uuid,
                 from_host=task.from_host,
                 to_host=task.to_host,
@@ -84,7 +84,7 @@ class MigrationRunner:
             return MigrationResult(
                 task_id=task.task_id,
                 plan_id=task.plan_id,
-                policy_name=task.policy_name,
+                aggregate=task.aggregate,
                 instance_uuid=task.instance_uuid,
                 from_host=task.from_host,
                 to_host=task.to_host,
