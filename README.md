@@ -28,6 +28,7 @@ them out through the Nova live-migrate API.
               |    score all policies     |              |
               |    combined imbalance     |              |
               |    profile all VMs        |              |
+              |    enforce affinity rules |              |
               |    plan combined moves    |              |
               +------------+--------------+              |
                            |                             |
@@ -50,10 +51,18 @@ them out through the Nova live-migrate API.
 4. **Combined scoring**: the planner simulates moves against every policy's
    scores simultaneously, minimizing a weighted sum of imbalances (policy
    `weight` values sum to 1.0).
-5. **Constraint checker** respects Nova server group hard and soft anti-affinity.
-6. **Cooldown tracker** prevents oscillation via aggregate-level and
+5. **Constraint checker** respects all four Nova server-group placement
+   policies: `affinity`, `anti-affinity`, `soft-affinity`, and
+   `soft-anti-affinity`. A move that would break any of them is rejected.
+6. **Affinity enforcer** (optional) runs before the planner and proposes
+   migrations to repair existing server-group violations. Enabled per
+   policy class via `[engine] enforce_hard_affinity` and
+   `enforce_soft_affinity`. Destinations are picked to minimise the
+   combined imbalance and never cross a policy threshold. Repair and
+   imbalance moves share a single `max_migrations_per_cycle` budget.
+7. **Cooldown tracker** prevents oscillation via aggregate-level and
    instance-level cooldowns.
-7. **Executor** consumes migration tasks, validates pre-flight state, calls
+8. **Executor** consumes migration tasks, validates pre-flight state, calls
    Nova live-migrate, polls until completion, and verifies post-flight.
 
 ## Quick Start
@@ -106,6 +115,11 @@ include_unassigned_hosts = false
 # Cooldowns (seconds)
 cooldown = 600
 instance_cooldown = 900
+
+# Optional: repair existing server-group violations every cycle.
+# Both off by default.
+enforce_hard_affinity = false
+enforce_soft_affinity = false
 
 [prometheus]
 url = http://prometheus:9090
@@ -227,10 +241,15 @@ evaluates all enabled policies against each aggregate every cycle:
 
 1. **Score** — each policy runs its PromQL imbalance query; values must be in [0, 1]
 2. **Profile** — collect per-VM resource weights *across all policies* in one pass
-3. **Constrain** — respect Nova server group hard and soft anti-affinity
-4. **Plan** — simulate moves minimizing the weighted combined imbalance
-5. **Cast** — send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`
-6. **Cooldown** — enforce aggregate-level and instance-level cooldown
+3. **Constrain** — reject any move that would break a Nova server-group placement rule
+4. **Enforce** (optional) — when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
+   propose repair moves for VMs already violating their groups
+5. **Plan** — simulate moves minimizing the weighted combined imbalance, sharing the
+   per-cycle migration budget with the enforcer
+6. **Cast** — send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
+   task carries a `phase` field (`affinity`, `spread`, or `pack`) that surfaces in
+   logs so operators can see why each migration was proposed
+7. **Cooldown** — enforce aggregate-level and instance-level cooldown
 
 ### Executor (migration runner)
 
@@ -261,8 +280,10 @@ kronos/
 ├── common/        Shared utilities, exceptions, oslo.config registration, oslo.messaging helpers
 ├── policies/      Pydantic models and YAML loader for policy definitions
 ├── clients/       Prometheus HTTP client, Nova/OpenStack client (read + live-migrate)
-├── engine/        Control loop, scoring, profiling, constraint checking, planning, cooldown tracking
+├── engine/        Control loop, scoring, profiling, constraint checking, affinity enforcement, planning, cooldown tracking
 └── executor/      Migration executor: worker, scheduler, migration runner
+
+tools/             Operational helpers (e.g. generate_fake_snapshot.py for benchmarks)
 ```
 
 ## Development
@@ -279,6 +300,25 @@ ruff check kronos/ tests/
 # Type check
 mypy kronos/
 ```
+
+## Benchmarks
+
+Generate a synthetic snapshot in the same shape `kronos-record` writes,
+then replay it with timings to measure planner performance without
+needing a real cluster:
+
+```bash
+python tools/generate_fake_snapshot.py \
+    --hosts 50 --vms 5000 --groups 100 --seed 42 \
+    /tmp/snapshot-fake
+
+# Point [engine] policies_file at /tmp/snapshot-fake/policies.yaml,
+# then:
+kronos-replay --config-file /tmp/kronos.conf --time /tmp/snapshot-fake
+```
+
+`--time` prints per-phase wall-clock timings (scorer, profiler,
+enforcer, planner) so you can see where cycles are spent.
 
 ## Roadmap
 
