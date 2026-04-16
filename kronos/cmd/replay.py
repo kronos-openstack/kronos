@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from kronos.clients.prometheus import PrometheusHealth, QueryResult
 from kronos.common.config import register_opts
 from kronos.common.exceptions import AggregateNotFound
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
+from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
@@ -122,7 +124,14 @@ class ReplayPrometheusClient:
         )
 
 
-def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
+def _run_replay(
+    snapshot_dir: Path,
+    policies_file: str,
+    *,
+    enforce_hard: bool,
+    enforce_soft: bool,
+    show_timings: bool,
+) -> int:
     """Run a single engine cycle against snapshot data."""
     nova = ReplayNovaClient(snapshot_dir)
     prometheus = ReplayPrometheusClient(snapshot_dir)
@@ -130,6 +139,11 @@ def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
     scorer = PolicyScorer(prometheus)  # type: ignore[arg-type]
     profiler = VmProfiler(prometheus, nova)  # type: ignore[arg-type]
     constraints = ConstraintChecker(nova)  # type: ignore[arg-type]
+    enforcer = AffinityEnforcer(
+        constraints,
+        enforce_hard=enforce_hard,
+        enforce_soft=enforce_soft,
+    )
     planner = Planner(constraints)
 
     policies = load_policies(policies_file)
@@ -140,6 +154,14 @@ def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
     for key in nova._aggregates:
         aggregates.append(None if key == UNASSIGNED_TOPIC_MARKER else key)
 
+    totals: dict[str, float] = {
+        "scorer": 0.0,
+        "profiler": 0.0,
+        "enforcer": 0.0,
+        "planner": 0.0,
+    }
+    cycle_start = time.perf_counter()
+
     for aggregate in aggregates:
         name = aggregate if aggregate is not None else "<unassigned>"
         LOG.info("=== Aggregate: %s ===", name)
@@ -149,7 +171,9 @@ def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
             LOG.info("  No hosts recorded, skipping.")
             continue
 
+        t0 = time.perf_counter()
         policy_results = [scorer.evaluate(p, hosts) for p in enabled]
+        totals["scorer"] += time.perf_counter() - t0
 
         combined_imbalance = 0.0
         any_detected = False
@@ -168,13 +192,16 @@ def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
 
         LOG.info("  Combined imbalance: %.3f", combined_imbalance)
 
-        if not any_detected:
+        if not any_detected and not enforcer.enabled:
             continue
 
         active = [
             (p, pr) for p, pr in zip(enabled, policy_results, strict=True)
             if not pr.skipped
         ]
+        if not active:
+            LOG.info("  No active policies — cannot plan.")
+            continue
         active_policies = [p for p, _ in active]
         active_results = [pr for _, pr in active]
         host_scores_by_policy = {
@@ -182,23 +209,53 @@ def _run_replay(snapshot_dir: Path, policies_file: str) -> int:
             for p, pr in active
         }
 
+        t0 = time.perf_counter()
         vm_profiles = profiler.collect(
             policies=active_policies,
             hosts=hosts,
             host_scores_by_policy=host_scores_by_policy,
         )
+        totals["profiler"] += time.perf_counter() - t0
 
         if not vm_profiles:
             LOG.info("  No VM profiles collected — cannot plan.")
             continue
 
-        plan = planner.plan(
+        budget = max(p.max_migrations_per_cycle for p in active_policies)
+
+        t0 = time.perf_counter()
+        plan, scores, vms_by_host, remaining = enforcer.enforce(
             aggregate=name,
             policies=active_policies,
             policy_results=active_results,
             vm_profiles=vm_profiles,
+            budget=budget,
         )
+        totals["enforcer"] += time.perf_counter() - t0
+
+        if any_detected:
+            t0 = time.perf_counter()
+            plan = planner.plan(
+                aggregate=name,
+                policies=active_policies,
+                policy_results=active_results,
+                vm_profiles=vm_profiles,
+                scores=scores,
+                vms_by_host=vms_by_host,
+                budget=remaining,
+                plan=plan,
+            )
+            totals["planner"] += time.perf_counter() - t0
+
         _log_plan(plan)
+
+    if show_timings:
+        total = time.perf_counter() - cycle_start
+        LOG.info("--- Timings ---")
+        for phase, seconds in totals.items():
+            pct = (seconds / total * 100.0) if total else 0.0
+            LOG.info("  %-10s %.3fs  (%.1f%%)", phase, seconds, pct)
+        LOG.info("  %-10s %.3fs  (100.0%%)", "total", total)
 
     return 0
 
@@ -238,6 +295,16 @@ def main() -> int:
             help="Path to snapshot directory from kronos-record.",
         ),
     )
+    CONF.register_cli_opt(
+        cfg.BoolOpt(
+            "time",
+            default=False,
+            help=(
+                "Print per-phase wall-clock timings (scorer, profiler, "
+                "enforcer, planner) at the end of the cycle."
+            ),
+        ),
+    )
 
     CONF(
         sys.argv[1:],
@@ -261,4 +328,10 @@ def main() -> int:
             len(meta.get("policy_names", [])),
         )
 
-    return _run_replay(snapshot_dir, CONF.engine.policies_file)
+    return _run_replay(
+        snapshot_dir,
+        CONF.engine.policies_file,
+        enforce_hard=CONF.engine.enforce_hard_affinity,
+        enforce_soft=CONF.engine.enforce_soft_affinity,
+        show_timings=CONF["time"],
+    )
