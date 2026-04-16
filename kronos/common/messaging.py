@@ -18,12 +18,16 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import oslo_messaging
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from kronos.common.config import MESSAGING_GROUP
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 LOG = logging.getLogger(__name__)
 
@@ -157,7 +161,7 @@ def get_notification_listener(
 # --- Serialization helpers (shared) ---
 
 
-def task_to_dict(task: object) -> dict[str, object]:
+def task_to_dict(task: DataclassInstance) -> dict[str, object]:
     """Serialize a dataclass to a dict suitable for oslo.messaging payload.
 
     Converts datetime fields to ISO 8601 strings.
@@ -172,7 +176,9 @@ def task_to_dict(task: object) -> dict[str, object]:
     return d
 
 
-def dict_to_dataclass(cls: type, data: dict[str, object]) -> object:
+def dict_to_dataclass[T: DataclassInstance](
+    cls: type[T], data: dict[str, object],
+) -> T:
     """Deserialize a dict (from oslo.messaging payload) into a dataclass.
 
     Handles datetime fields by parsing ISO 8601 strings.

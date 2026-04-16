@@ -12,7 +12,7 @@ It never calls Nova live-migrate directly.
 - `scorer.py` — PolicyScorer: runs one policy's PromQL imbalance_query against a host list, normalises scores, enforces the [0, 1] contract
 - `profiler.py` — VmProfiler: collects per-VM resource weights across all policies for an aggregate in one pass
 - `planner.py` — Planner: combined-scoring simulation (spread greedy + pack First Fit Decreasing)
-- `constraints.py` — ConstraintChecker: validates moves against Nova server group anti-affinity (hard and soft)
+- `constraints.py` — ConstraintChecker: validates moves against all four Nova server group placement policies (affinity, anti-affinity, soft-affinity, soft-anti-affinity)
 - `cooldown.py` — CooldownTracker: aggregate-level and instance-level cooldowns
 - `loop.py` — EngineLoop: periodic per-aggregate evaluation cycle, plan emission via RPC cast
 
@@ -49,7 +49,7 @@ oslo.config → EngineLoop
                 │       │   └── VmProfile.weights[policy_name] for every policy
                 │       │
                 │       ├── Planner.plan(aggregate, policies, policy_results, vm_profiles)
-                │       │   ├── ConstraintChecker (anti-affinity + soft-anti-affinity)
+                │       │   ├── ConstraintChecker (affinity, anti-affinity, soft variants)
                 │       │   ├── spread: greedy best-move-per-round minimising combined imbalance
                 │       │   └── pack: First Fit Decreasing, combined utilization for ordering
                 │       │
@@ -143,15 +143,30 @@ fallback has no data for it.
 
 ## Constraint Checking
 The ConstraintChecker reads Nova server groups across all projects and
-treats **both** `anti-affinity` and `soft-anti-affinity` as move-blocking
-(soft anti-affinity is best-effort at Nova placement time; Kronos
-respects the hint at migration time so it never deliberately collapses a
-previously-spread group).
+treats **all four** Nova server group placement policies as
+move-blocking:
+
+- `anti-affinity` / `soft-anti-affinity`: a move is rejected if another
+  group member already lives on the destination host.
+- `affinity` / `soft-affinity`: a move is rejected unless every other
+  *currently placed* member of the group is already on the destination
+  host. Members outside the current aggregate are ignored — Kronos
+  only reasons about VMs visible in the planner's `vms_by_host` index.
+
+Soft rules are currently enforced with the same strictness as hard
+ones. They will later be promoted to weighted planner penalties (so a
+move that mildly violates a soft rule can still win if it resolves a
+much larger imbalance), but for now both flavours veto.
 
 The cache is invalidated each engine cycle.
 
-Future: NUMA, CPU feature flags, flavor extra specs, other Nova server
-group policies — https://docs.openstack.org/nova/latest/user/server-groups.html
+Kronos only *guards* against breaking these rules during migration; it
+does not yet proactively repair groups that are already in violation
+when the engine starts. That "repair mode" is a future addition.
+
+Future: NUMA, CPU feature flags, flavor extra specs, soft-rule
+penalties, constraint repair mode —
+https://docs.openstack.org/nova/latest/user/server-groups.html
 
 ## Cooldown Tracking
 The CooldownTracker prevents oscillation and migration storms:

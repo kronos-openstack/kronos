@@ -87,7 +87,6 @@ class NovaClient:
     """OpenStack Nova client.
 
     Uses openstacksdk with a keystoneauth1 session loaded from oslo.config.
-    Read-only in M1 — live-migrate calls will be added in M3.
     """
 
     def __init__(self, conf: cfg.ConfigOpts) -> None:
@@ -280,7 +279,7 @@ class NovaClient:
             )
         return result
 
-    # --- M3: Write operations ---
+    # --- Write operations ---
 
     def get_instance_status(
         self, instance_uuid: str,
