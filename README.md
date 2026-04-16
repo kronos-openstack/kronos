@@ -327,9 +327,18 @@ enforcer, planner) so you can see where cycles are spent.
 | **M1** | Project skeleton, oslo.config, clients, dry-run engine loop | Done |
 | **M2** | VM profiling, simulation-based migration planning, constraint checking, record/replay | Done |
 | **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
-| **M4** | HA via tooz distributed locks, active-passive, rate limiting | Planned |
-| **M5** | REST API, policy CRUD, audit logging | Planned |
-| **M6** | PyPI packaging, systemd units, documentation | Planned |
+| **M3.5** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
+| **M4** | HA via tooz distributed locks, active-passive engines and executors, distributed rate limiting | Planned |
+| **M5** | Audit logging (append-only JSONL) and general logging cleanup | Planned |
+| **M6** | PyPI packaging, container image, systemd units, documentation | Planned |
+
+Independent named milestones (any order):
+
+| Name | Scope |
+|------|-------|
+| Pack-rework | Pack mode redesign + compactor parity (`post_drain_action`, `ha_reserve`, host re-enable) |
+| Executor-timeout | Drop the executor's migration timeout and rely on Nova's |
+| Executor-multi-aggregate | One executor process can service multiple aggregates (one thread per topic) |
 
 ## License
 
