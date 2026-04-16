@@ -19,15 +19,10 @@ from oslo_log import log as logging
 
 from kronos.engine._sim import (
     PolicyScores,
-    all_policies_happy,
-    apply_move_to_scores,
-    combined_host_score,
-    combined_imbalance,
+    ScoreState,
     combined_vm_weight,
     group_vms_by_host,
-    move_hurts_any_policy,
     move_vm_between_hosts,
-    simulate_move,
 )
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.types import (
@@ -108,6 +103,8 @@ class Planner:
                 for p, r in active
             }
 
+        state = ScoreState.from_scores(scores)
+
         mode = active_policies[0].mode
         default_budget = max(p.max_migrations_per_cycle for p in active_policies)
         if budget is None:
@@ -120,22 +117,22 @@ class Planner:
             return plan
 
         if fresh_plan:
-            plan.initial_imbalance = combined_imbalance(scores, active_policies)
+            plan.initial_imbalance = state.combined_imbalance(active_policies)
 
         if vms_by_host is None:
             vms_by_host = group_vms_by_host(vm_profiles)
 
         if mode == PolicyMode.SPREAD:
             self._plan_spread(
-                active_policies, scores, vms_by_host, budget, plan,
+                active_policies, state, vms_by_host, budget, plan,
             )
         elif mode == PolicyMode.PACK:
             self._plan_pack(
-                active_policies, scores, vm_profiles, vms_by_host,
+                active_policies, state, vm_profiles, vms_by_host,
                 budget, plan,
             )
 
-        plan.projected_imbalance = combined_imbalance(scores, active_policies)
+        plan.projected_imbalance = state.combined_imbalance(active_policies)
         return plan
 
     # --- Spread ---
@@ -143,7 +140,7 @@ class Planner:
     def _plan_spread(
         self,
         policies: list[PolicyConfig],
-        scores: PolicyScores,
+        state: ScoreState,
         vms_by_host: dict[str, list[VmProfile]],
         budget: int,
         plan: MigrationPlan,
@@ -155,26 +152,25 @@ class Planner:
         ``budget`` is reached, or no improving move exists.
         """
         for _ in range(budget):
-            if all_policies_happy(scores, policies):
+            if state.all_policies_happy(policies):
                 break
 
-            best = self._find_best_spread_move(
-                policies, scores, vms_by_host,
-            )
-            if best is None:
+            step = self._find_best_spread_move(policies, state, vms_by_host)
+            if step is None:
                 break
 
-            step, new_scores = best
             plan.steps.append(step)
-            apply_move_to_scores(scores, new_scores)
+            vm = _find_vm(vms_by_host, step.from_host, step.instance_uuid)
+            if vm is not None:
+                state.apply(vm, step.from_host, step.to_host)
             move_vm_between_hosts(vms_by_host, step)
 
     def _find_best_spread_move(
         self,
         policies: list[PolicyConfig],
-        scores: PolicyScores,
+        state: ScoreState,
         vms_by_host: dict[str, list[VmProfile]],
-    ) -> tuple[MigrationStep, PolicyScores] | None:
+    ) -> MigrationStep | None:
         """Find the single best move minimising combined imbalance.
 
         A candidate move is rejected if it would make any individual
@@ -184,12 +180,11 @@ class Planner:
         imbalance) but never pushes a previously-OK policy into
         violation, or worsens an already-violating policy further.
         """
-        current_combined = combined_imbalance(scores, policies)
+        current_combined = state.combined_imbalance(policies)
         best_step: MigrationStep | None = None
-        best_scores: PolicyScores | None = None
         best_improvement = 0.0
 
-        all_hosts = list(scores[policies[0].name].keys())
+        all_hosts = list(state.scores[policies[0].name].keys())
 
         for source_host in all_hosts:
             source_vms = vms_by_host.get(source_host, [])
@@ -204,17 +199,18 @@ class Planner:
                     if not self._constraints.check(vm, dest_host, vms_by_host):
                         continue
 
-                    simulated = simulate_move(scores, vm, source_host, dest_host)
-
-                    if move_hurts_any_policy(scores, simulated, policies):
+                    if state.simulated_move_hurts_any_policy(
+                        vm, source_host, dest_host, policies,
+                    ):
                         continue
 
-                    new_combined = combined_imbalance(simulated, policies)
+                    new_combined = state.simulated_combined_imbalance(
+                        vm, source_host, dest_host, policies,
+                    )
                     improvement = current_combined - new_combined
 
                     if improvement > best_improvement:
                         best_improvement = improvement
-                        best_scores = simulated
                         best_step = MigrationStep(
                             instance_uuid=vm.instance_uuid,
                             instance_name=vm.instance_name,
@@ -224,16 +220,14 @@ class Planner:
                             phase=MigrationPhase.SPREAD,
                         )
 
-        if best_step is None or best_scores is None:
-            return None
-        return best_step, best_scores
+        return best_step
 
     # --- Pack ---
 
     def _plan_pack(
         self,
         policies: list[PolicyConfig],
-        scores: PolicyScores,
+        state: ScoreState,
         vm_profiles: dict[str, VmProfile],
         vms_by_host: dict[str, list[VmProfile]],
         budget: int,
@@ -252,10 +246,10 @@ class Planner:
         draining: set[str] = set()
 
         # Coldest-first by combined score
-        all_hosts = list(scores[policies[0].name].keys())
+        all_hosts = list(state.scores[policies[0].name].keys())
         sorted_hosts = sorted(
             all_hosts,
-            key=lambda h: combined_host_score(scores, policies, h),
+            key=lambda h: state.combined_host_score(policies, h),
         )
 
         migrations_done = 0
@@ -279,7 +273,7 @@ class Planner:
                     break
 
                 dest = self._find_pack_destination(
-                    policies, scores, vm, draining, vms_by_host,
+                    policies, state, vm, draining, vms_by_host,
                 )
                 if dest is None:
                     continue
@@ -294,31 +288,33 @@ class Planner:
                 )
                 plan.steps.append(step)
 
-                new_scores = simulate_move(scores, vm, source_host, dest)
-                apply_move_to_scores(scores, new_scores)
+                state.apply(vm, source_host, dest)
                 move_vm_between_hosts(vms_by_host, step)
                 migrations_done += 1
 
     def _find_pack_destination(
         self,
         policies: list[PolicyConfig],
-        scores: PolicyScores,
+        state: ScoreState,
         vm: VmProfile,
         draining: set[str],
         vms_by_host: dict[str, list[VmProfile]],
     ) -> str | None:
         """Fullest non-draining host that fits within every policy's capacity."""
-        all_hosts = list(scores[policies[0].name].keys())
+        all_hosts = list(state.scores[policies[0].name].keys())
         candidates = sorted(
             (h for h in all_hosts if h not in draining and h != vm.host),
-            key=lambda h: combined_host_score(scores, policies, h),
+            key=lambda h: state.combined_host_score(policies, h),
             reverse=True,
         )
 
         for host in candidates:
             fits = True
             for policy in policies:
-                projected = scores[policy.name][host] + vm.weights.get(policy.name, 0.0)
+                projected = (
+                    state.scores[policy.name][host]
+                    + vm.weights.get(policy.name, 0.0)
+                )
                 if projected > policy.capacity_threshold:
                     fits = False
                     break
@@ -330,3 +326,14 @@ class Planner:
             return host
 
         return None
+
+
+def _find_vm(
+    vms_by_host: dict[str, list[VmProfile]],
+    host: str,
+    instance_uuid: str,
+) -> VmProfile | None:
+    for vm in vms_by_host.get(host, []):
+        if vm.instance_uuid == instance_uuid:
+            return vm
+    return None

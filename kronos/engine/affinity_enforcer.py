@@ -29,11 +29,9 @@ from oslo_log import log as logging
 
 from kronos.engine._sim import (
     PolicyScores,
-    combined_imbalance,
+    ScoreState,
     group_vms_by_host,
-    move_hurts_any_policy,
     move_vm_between_hosts,
-    simulate_move,
 )
 from kronos.engine.constraints import (
     AFFINITY_POLICIES,
@@ -125,7 +123,8 @@ class AffinityEnforcer:
         if not self.enabled or budget <= 0 or not active_policies:
             return plan, scores, vms_by_host, budget
 
-        plan.initial_imbalance = combined_imbalance(scores, active_policies)
+        state = ScoreState.from_scores(scores)
+        plan.initial_imbalance = state.combined_imbalance(active_policies)
 
         relevant = self._select_groups()
         if not relevant:
@@ -143,7 +142,7 @@ class AffinityEnforcer:
             step = self._plan_one_repair(
                 violations,
                 active_policies,
-                scores,
+                state,
                 vms_by_host,
                 vm_profiles,
             )
@@ -167,13 +166,13 @@ class AffinityEnforcer:
                 step.instance_uuid[:8],
                 step.from_host,
                 step.to_host,
-                combined_imbalance(scores, active_policies) + step.improvement,
-                combined_imbalance(scores, active_policies),
+                state.combined_imbalance(active_policies) + step.improvement,
+                state.combined_imbalance(active_policies),
             )
             plan.steps.append(step)
             steps_used += 1
 
-        plan.projected_imbalance = combined_imbalance(scores, active_policies)
+        plan.projected_imbalance = state.combined_imbalance(active_policies)
         return plan, scores, vms_by_host, budget - steps_used
 
     # --- Internals ---
@@ -191,7 +190,7 @@ class AffinityEnforcer:
         self,
         violations: list[_Violation],
         policies: list[PolicyConfig],
-        scores: PolicyScores,
+        state: ScoreState,
         vms_by_host: dict[str, list[VmProfile]],
         vm_profiles: dict[str, VmProfile],
     ) -> MigrationStep | None:
@@ -199,8 +198,10 @@ class AffinityEnforcer:
         move that leaves the combined imbalance lowest.
 
         Destinations that would push any policy past its threshold are
-        rejected (``move_hurts_any_policy``), as are destinations that
-        violate any *other* server group the VM belongs to.
+        rejected, as are destinations that would violate any *other*
+        server group the VM belongs to.  On success the chosen move is
+        committed to ``state`` and ``vms_by_host`` so the next
+        iteration sees the post-move world.
         """
         # Candidate VMs = the union of offending UUIDs across all
         # violations.  A single VM may be offending multiple groups at
@@ -209,8 +210,8 @@ class AffinityEnforcer:
         for v in violations:
             candidate_uuids |= v.offending_uuids
 
-        hosts = list(scores[policies[0].name].keys())
-        current_combined = combined_imbalance(scores, policies)
+        hosts = list(state.scores[policies[0].name].keys())
+        current_combined = state.combined_imbalance(policies)
 
         best_step: MigrationStep | None = None
         best_combined = float("inf")
@@ -229,11 +230,14 @@ class AffinityEnforcer:
                 if not self._constraints.check(vm, dest, vms_by_host):
                     continue
 
-                simulated = simulate_move(scores, vm, vm.host, dest)
-                if move_hurts_any_policy(scores, simulated, policies):
+                if state.simulated_move_hurts_any_policy(
+                    vm, vm.host, dest, policies,
+                ):
                     continue
 
-                new_combined = combined_imbalance(simulated, policies)
+                new_combined = state.simulated_combined_imbalance(
+                    vm, vm.host, dest, policies,
+                )
                 # Strict improvement tie-break with sorted iteration
                 # gives determinism.
                 if new_combined < best_combined:
@@ -250,16 +254,11 @@ class AffinityEnforcer:
         if best_step is None:
             return None
 
-        # Apply to the simulation state so the next iteration and the
-        # downstream imbalance planner see the post-move world.
-        applied = simulate_move(
-            scores,
+        state.apply(
             vm_profiles[best_step.instance_uuid],
             best_step.from_host,
             best_step.to_host,
         )
-        for policy_name, host_scores in applied.items():
-            scores[policy_name] = host_scores
         move_vm_between_hosts(vms_by_host, best_step)
         return best_step
 
