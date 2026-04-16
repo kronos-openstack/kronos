@@ -31,6 +31,7 @@ from kronos.common.messaging import (
     migrations_topic,
     task_to_dict,
 )
+from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
 from kronos.engine.planner import Planner
@@ -60,6 +61,11 @@ class EngineLoop:
         self._profiler = VmProfiler(self._prometheus, self._nova)
         self._constraints = ConstraintChecker(self._nova)
         self._planner = Planner(self._constraints)
+        self._enforcer = AffinityEnforcer(
+            self._constraints,
+            enforce_hard=conf.engine.enforce_hard_affinity,
+            enforce_soft=conf.engine.enforce_soft_affinity,
+        )
         self._cooldown = CooldownTracker(
             aggregate_cooldown_seconds=float(conf.engine.cooldown),
             instance_cooldown_seconds=float(conf.engine.instance_cooldown),
@@ -202,26 +208,35 @@ class EngineLoop:
         result.combined_imbalance = combined_imbalance
         result.imbalance_detected = any_detected
 
-        if not any_detected:
+        # Profiling + planning run whenever imbalance is detected OR the
+        # affinity enforcer is enabled (violations can exist even with
+        # no imbalance signal).
+        if not any_detected and not self._enforcer.enabled:
             return result
 
-        # Cooldown check
-        if not dry_run and self._cooldown.is_aggregate_cooling(name):
+        # Cooldown check applies to any migration emission.  Enforced
+        # in dry-run too so the simulated cycle rhythm matches what
+        # production would actually do.
+        if self._cooldown.is_aggregate_cooling(name):
             LOG.info(
-                "Aggregate '%s': imbalance detected but cooldown active, skipping planning.",
+                "Aggregate '%s': cooldown active, skipping planning.",
                 name,
             )
             return result
 
-        # Collect per-policy VM profiles
         active_policies = [
             p for p, pr in zip(policies, policy_results, strict=True)
             if not pr.skipped
         ]
+        active_results = [
+            pr for pr in policy_results if not pr.skipped
+        ]
+        if not active_policies:
+            return result
+
         host_scores_by_policy = {
             p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
-            for p, pr in zip(policies, policy_results, strict=True)
-            if not pr.skipped
+            for p, pr in zip(active_policies, active_results, strict=True)
         }
         vm_profiles = self._profiler.collect(
             policies=active_policies,
@@ -233,20 +248,40 @@ class EngineLoop:
         if not vm_profiles:
             return result
 
-        # Plan with combined scoring
-        plan = self._planner.plan(
+        budget = max(p.max_migrations_per_cycle for p in active_policies)
+
+        # --- Affinity enforcement pass (repair existing violations) ---
+        plan, scores, vms_by_host, remaining = self._enforcer.enforce(
             aggregate=name,
             policies=active_policies,
-            policy_results=[
-                pr for p, pr in zip(policies, policy_results, strict=True)
-                if not pr.skipped
-            ],
+            policy_results=active_results,
             vm_profiles=vm_profiles,
+            budget=budget,
         )
+
+        # --- Imbalance pass (reduce PromQL-driven imbalance) ---
+        # Only runs if the scorer flagged imbalance and budget remains.
+        # The enforcer may have left some imbalance behind; that's fine,
+        # the planner tackles it within `remaining` moves.
+        if any_detected:
+            plan = self._planner.plan(
+                aggregate=name,
+                policies=active_policies,
+                policy_results=active_results,
+                vm_profiles=vm_profiles,
+                scores=scores,
+                vms_by_host=vms_by_host,
+                budget=remaining,
+                plan=plan,
+            )
         result.migration_plan = plan
 
-        if not dry_run and plan.steps:
-            self._emit_plan(plan, aggregate)
+        if plan.steps:
+            if not dry_run:
+                self._emit_plan(plan, aggregate)
+            # Record cooldown unconditionally — keeping dry-run's rhythm
+            # aligned with production means the simulated log shows
+            # exactly the skipped cycles an operator would see live.
             self._cooldown.record_plan_emission(
                 name,
                 [step.instance_uuid for step in plan.steps],
@@ -283,9 +318,10 @@ class EngineLoop:
             )
             client.cast({}, "execute_migration", task=task_to_dict(task))
             LOG.info(
-                "Cast migration task %s: %s (%s) %s -> %s "
+                "Cast migration task %s [%s]: %s (%s) %s -> %s "
                 "(plan=%s, not_before=+%ds)",
                 task.task_id[:8],
+                step.phase.value.upper(),
                 step.instance_name,
                 step.instance_uuid[:8],
                 step.from_host,
@@ -357,8 +393,9 @@ class EngineLoop:
         )
         for i, step in enumerate(plan.steps, 1):
             LOG.info(
-                "    [%d] %s (%s): %s -> %s (improvement=%.3f)",
+                "    [%d][%s] %s (%s): %s -> %s (improvement=%.3f)",
                 i,
+                step.phase.value.upper(),
                 step.instance_name,
                 step.instance_uuid[:8],
                 step.from_host,

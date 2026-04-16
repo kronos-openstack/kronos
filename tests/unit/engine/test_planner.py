@@ -7,12 +7,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from kronos.engine.planner import (
-    Planner,
-    _combined_imbalance,
-    _group_vms_by_host,
-    _simulate_move,
+from kronos.engine._sim import (
+    combined_imbalance,
+    group_vms_by_host,
+    simulate_move,
 )
+from kronos.engine.planner import Planner
 from kronos.engine.types import HostScore, MigrationPlan, PolicyResult, VmProfile
 from kronos.policies.models import PolicyConfig, PolicyMode
 
@@ -97,15 +97,15 @@ def planner(allow_all_constraints: MagicMock) -> Planner:
 
 
 class TestHelpers:
-    def test_combined_imbalance_empty(self) -> None:
-        assert _combined_imbalance({}, []) == 0.0
+    def testcombined_imbalance_empty(self) -> None:
+        assert combined_imbalance({}, []) == 0.0
 
-    def test_combined_imbalance_single_policy(self) -> None:
+    def testcombined_imbalance_single_policy(self) -> None:
         scores = {"p1": {"h1": 0.8, "h2": 0.3}}
         policies = [_make_policy(name="p1", weight=1.0)]
-        assert _combined_imbalance(scores, policies) == pytest.approx(0.5)
+        assert combined_imbalance(scores, policies) == pytest.approx(0.5)
 
-    def test_combined_imbalance_two_policies(self) -> None:
+    def testcombined_imbalance_two_policies(self) -> None:
         scores = {
             "cpu": {"h1": 0.4, "h2": 0.2},     # imbalance 0.2
             "mem": {"h1": 0.9, "h2": 0.3},     # imbalance 0.6
@@ -115,15 +115,15 @@ class TestHelpers:
             _make_policy(name="mem", weight=0.7),
         ]
         # 0.3 * 0.2 + 0.7 * 0.6 = 0.06 + 0.42 = 0.48
-        assert _combined_imbalance(scores, policies) == pytest.approx(0.48)
+        assert combined_imbalance(scores, policies) == pytest.approx(0.48)
 
-    def test_simulate_move_affects_all_policies(self) -> None:
+    def testsimulate_move_affects_all_policies(self) -> None:
         scores = {
             "cpu": {"h1": 0.5, "h2": 0.2},
             "mem": {"h1": 0.8, "h2": 0.3},
         }
         vm = _vm("v1", "h1", {"cpu": 0.1, "mem": 0.2})
-        new = _simulate_move(scores, vm, "h1", "h2")
+        new = simulate_move(scores, vm, "h1", "h2")
         assert new["cpu"]["h1"] == pytest.approx(0.4)
         assert new["cpu"]["h2"] == pytest.approx(0.3)
         assert new["mem"]["h1"] == pytest.approx(0.6)
@@ -131,13 +131,13 @@ class TestHelpers:
         # original unchanged
         assert scores["cpu"]["h1"] == pytest.approx(0.5)
 
-    def test_group_vms_by_host(self) -> None:
+    def testgroup_vms_by_host(self) -> None:
         profiles = {
             "v1": _vm("v1", "h1", {"p1": 0.1}),
             "v2": _vm("v2", "h1", {"p1": 0.2}),
             "v3": _vm("v3", "h2", {"p1": 0.3}),
         }
-        grouped = _group_vms_by_host(profiles)
+        grouped = group_vms_by_host(profiles)
         assert len(grouped["h1"]) == 2
         assert len(grouped["h2"]) == 1
 

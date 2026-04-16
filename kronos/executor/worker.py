@@ -167,6 +167,7 @@ class ExecutorWorker:
             from_host=task.from_host,
             to_host=task.to_host,
             improvement=task.improvement,
+            phase=task.phase,
             priority=task.priority,
             max_retries=task.max_retries,
             retry_count=task.retry_count + 1,

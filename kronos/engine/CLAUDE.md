@@ -8,11 +8,13 @@ moves, produces migration plans, and casts them over RPC to the executor.
 It never calls Nova live-migrate directly.
 
 ## Key Files
-- `types.py` — Dataclasses: HostScore, VmProfile, MigrationStep, MigrationPlan, MigrationTask, MigrationResult, PolicyResult, AggregateResult, CycleReport
+- `types.py` — Dataclasses and enums: HostScore, VmProfile, MigrationStep, MigrationPlan, MigrationTask, MigrationResult, MigrationPhase, PolicyResult, AggregateResult, CycleReport
+- `_sim.py` — Shared simulation helpers (combined_imbalance, simulate_move, etc.) used by both the planner and the affinity enforcer
 - `scorer.py` — PolicyScorer: runs one policy's PromQL imbalance_query against a host list, normalises scores, enforces the [0, 1] contract
 - `profiler.py` — VmProfiler: collects per-VM resource weights across all policies for an aggregate in one pass
 - `planner.py` — Planner: combined-scoring simulation (spread greedy + pack First Fit Decreasing)
 - `constraints.py` — ConstraintChecker: validates moves against all four Nova server group placement policies (affinity, anti-affinity, soft-affinity, soft-anti-affinity)
+- `affinity_enforcer.py` — AffinityEnforcer: repair pass that moves VMs out of existing server-group violations, using the same combined-imbalance math to pick destinations
 - `cooldown.py` — CooldownTracker: aggregate-level and instance-level cooldowns
 - `loop.py` — EngineLoop: periodic per-aggregate evaluation cycle, plan emission via RPC cast
 
@@ -40,7 +42,7 @@ oslo.config → EngineLoop
                 │   │
                 │   ├── combined_imbalance = Σ (policy.weight × policy.imbalance)
                 │   │
-                │   └── if any policy.imbalance_detected:
+                │   └── if any policy.imbalance_detected OR enforcer.enabled:
                 │       ├── check cooldown (skip if aggregate is cooling)
                 │       │
                 │       ├── VmProfiler.collect(policies, hosts, host_scores_by_policy)
@@ -48,7 +50,17 @@ oslo.config → EngineLoop
                 │       │   ├── PrometheusClient.instant_query(vm_profile_query)  — one per policy
                 │       │   └── VmProfile.weights[policy_name] for every policy
                 │       │
-                │       ├── Planner.plan(aggregate, policies, policy_results, vm_profiles)
+                │       ├── AffinityEnforcer.enforce(...)        — phase="affinity"
+                │       │   ├── detect server-group violations (hard or soft, per config)
+                │       │   ├── for each violation, pick best (offending_vm, dest) pair
+                │       │   │     destination minimises combined imbalance
+                │       │   │     destination cannot push any policy above threshold
+                │       │   │     destination cannot break another server-group rule
+                │       │   └── consumes enforcement moves from max_migrations_per_cycle
+                │       │
+                │       ├── Planner.plan(...)                     — phase="spread" or "pack"
+                │       │   ├── starts from post-enforcement scores + vms_by_host
+                │       │   ├── budget = max_migrations_per_cycle − enforcement steps
                 │       │   ├── ConstraintChecker (affinity, anti-affinity, soft variants)
                 │       │   ├── spread: greedy best-move-per-round minimising combined imbalance
                 │       │   └── pack: First Fit Decreasing, combined utilization for ordering
@@ -160,13 +172,73 @@ much larger imbalance), but for now both flavours veto.
 
 The cache is invalidated each engine cycle.
 
-Kronos only *guards* against breaking these rules during migration; it
-does not yet proactively repair groups that are already in violation
-when the engine starts. That "repair mode" is a future addition.
+Guarding against broken rules is separate from *repairing* existing
+violations — see the **Affinity Enforcement** section below.
 
 Future: NUMA, CPU feature flags, flavor extra specs, soft-rule
-penalties, constraint repair mode —
+penalties in the planner —
 https://docs.openstack.org/nova/latest/user/server-groups.html
+
+## Affinity Enforcement
+
+The AffinityEnforcer runs **before** the imbalance planner and
+proactively repairs server-group placements that are already in
+violation. It complements the ConstraintChecker: the checker guards
+against new violations, the enforcer fixes existing ones.
+
+Enabled per policy-type via `[engine]`:
+
+```ini
+enforce_hard_affinity = false   # affinity + anti-affinity
+enforce_soft_affinity = false   # soft-affinity + soft-anti-affinity
+```
+
+Both default false. The enforcer is a no-op when neither is enabled.
+
+### Algorithm
+
+For each aggregate, the enforcer iterates:
+
+1. Fetch the relevant server groups (filtered by the enabled flags).
+2. Detect violations against the current VM placement:
+   - `anti-affinity` / `soft-anti-affinity`: ≥2 members share a host.
+   - `affinity` / `soft-affinity`: members span >1 host.
+3. Collect the set of offending VM UUIDs across all violations.
+4. Simulate every (offending_vm, destination) pair. Accept only pairs
+   that:
+   - pass the ConstraintChecker (no other group rule broken);
+   - do not push any policy's imbalance above its threshold
+     (`_sim.move_hurts_any_policy`).
+5. Pick the pair that leaves the combined imbalance lowest. Apply it
+   to the simulation, record a step with phase `affinity`.
+6. Repeat until no violations remain, budget exhausted, or no legal
+   destination exists.
+
+The enforcer returns the simulated post-enforcement `scores`,
+`vms_by_host`, and remaining budget. The Planner starts from those so
+the imbalance pass sees the world the executor will actually observe.
+
+### Budget sharing
+
+Enforcement and imbalance planning share a single
+`max_migrations_per_cycle` budget (max across active policies).
+Enforcement consumes first; the imbalance planner gets the
+remainder. This keeps total churn bounded regardless of whether
+enforcement is active.
+
+### When no legal repair exists
+
+If no (vm, dest) pair clears the ConstraintChecker and threshold
+filters, the enforcer logs a warning and stops. The imbalance planner
+still runs with the remaining budget. "We cannot do magic" —
+unrepairable violations are a human-attention problem, not a
+blocker.
+
+### Cooldown semantics
+
+Repair moves go through the normal plan emission path, so aggregate
+and instance cooldowns fire exactly as they do for imbalance-driven
+moves.
 
 ## Cooldown Tracking
 The CooldownTracker prevents oscillation and migration storms:

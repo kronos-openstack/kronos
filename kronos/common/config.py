@@ -105,6 +105,34 @@ engine_opts = [
             "stay within the pool and never cross into a named aggregate."
         ),
     ),
+    cfg.BoolOpt(
+        "enforce_hard_affinity",
+        default=False,
+        help=(
+            "Emit enforcement migrations for Nova server groups with the "
+            "'affinity' or 'anti-affinity' policy when the current "
+            "placement violates the rule. Destinations are chosen to "
+            "minimise the combined policy imbalance from policies.yaml, "
+            "never violating the policy imbalance threshold. "
+            "Enforcement moves share max_migrations_per_cycle with the "
+            "imbalance planner."
+        ),
+    ),
+    cfg.BoolOpt(
+        "enforce_soft_affinity",
+        default=False,
+        help=(
+            "Emit enforcement migrations for Nova server groups with the "
+            "'soft-affinity' or 'soft-anti-affinity' policy when the "
+            "current placement violates the rule. Destinations are "
+            "chosen to minimise the combined policy imbalance from "
+            "policies.yaml, never violating the policy imbalance "
+            "threshold. Soft rules are best-effort at Nova placement "
+            "time; enable this only if you want Kronos to actively "
+            "fight the Nova scheduler when soft placement hints cannot "
+            "be honoured."
+        ),
+    ),
 ]
 
 prometheus_opts = [

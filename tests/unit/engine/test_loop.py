@@ -12,6 +12,7 @@ from kronos.engine.types import (
     AggregateResult,
     CycleReport,
     HostScore,
+    MigrationPhase,
     MigrationPlan,
     MigrationStep,
     PolicyResult,
@@ -81,6 +82,7 @@ def mock_engine():
         patch("kronos.engine.loop.VmProfiler") as mock_profiler_cls,
         patch("kronos.engine.loop.ConstraintChecker"),
         patch("kronos.engine.loop.Planner") as mock_planner_cls,
+        patch("kronos.engine.loop.AffinityEnforcer") as mock_enforcer_cls,
     ):
         conf = MagicMock()
         conf.engine.evaluation_interval = 10
@@ -90,12 +92,26 @@ def mock_engine():
         conf.engine.cooldown = 600
         conf.engine.aggregates = ["test-agg"]
         conf.engine.include_unassigned_hosts = False
+        conf.engine.enforce_hard_affinity = False
+        conf.engine.enforce_soft_affinity = False
 
         engine = EngineLoop(conf)
         engine._nova = mock_nova_cls.return_value
         engine._scorer = mock_scorer_cls.return_value
         engine._profiler = mock_profiler_cls.return_value
         engine._planner = mock_planner_cls.return_value
+
+        # Default enforcer: disabled, returns an empty plan plus the
+        # scores/vms_by_host passed through untouched.
+        enforcer = mock_enforcer_cls.return_value
+        enforcer.enabled = False
+        enforcer.enforce.return_value = (
+            MigrationPlan(aggregate="test-agg", policy_names=["test-policy"]),
+            {},
+            {},
+            0,
+        )
+        engine._enforcer = enforcer
 
         # Default: one host in the test aggregate
         engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2"]
@@ -276,6 +292,7 @@ class TestLogReport:
                         from_host="h1",
                         to_host="h2",
                         improvement=0.1,
+                        phase=MigrationPhase.SPREAD,
                     ),
                 ],
                 initial_imbalance=0.6,

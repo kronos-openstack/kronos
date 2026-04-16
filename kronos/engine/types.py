@@ -2,11 +2,28 @@
 
 from __future__ import annotations
 
+import enum
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from kronos.policies.models import PolicyMode
+
+
+class MigrationPhase(enum.StrEnum):
+    """Why a migration step was proposed.
+
+    ``affinity``: emitted by the affinity enforcer to repair a Nova
+    server-group violation.
+
+    ``spread``: emitted by the imbalance planner in spread mode.
+
+    ``pack``: emitted by the imbalance planner in pack mode.
+    """
+
+    AFFINITY = "affinity"
+    SPREAD = "spread"
+    PACK = "pack"
 
 
 @dataclass
@@ -46,6 +63,7 @@ class MigrationStep:
     from_host: str
     to_host: str
     improvement: float
+    phase: MigrationPhase
 
 
 @dataclass
@@ -119,6 +137,7 @@ class MigrationTask:
     from_host: str
     to_host: str
     improvement: float
+    phase: MigrationPhase
     priority: int = 5
     max_retries: int = 3
     retry_count: int = 0
@@ -145,6 +164,7 @@ class MigrationTask:
             from_host=step.from_host,
             to_host=step.to_host,
             improvement=step.improvement,
+            phase=step.phase,
             not_before=not_before,
             max_retries=max_retries,
             created_at=datetime.now(tz=UTC).isoformat(),

@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 
-from kronos.engine.types import MigrationResult, MigrationTask
+from kronos.engine.types import MigrationPhase, MigrationResult, MigrationTask
 from kronos.executor.scheduler import TaskScheduler
 
 
@@ -23,6 +23,7 @@ def _make_task(
         from_host="h1",
         to_host="h2",
         improvement=0.1,
+        phase=MigrationPhase.SPREAD,
         not_before=not_before,
     )
 

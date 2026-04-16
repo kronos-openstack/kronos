@@ -8,7 +8,7 @@ import pytest
 
 from kronos.clients.nova import MigrationStatus
 from kronos.common.exceptions import NovaClientError
-from kronos.engine.types import MigrationTask
+from kronos.engine.types import MigrationPhase, MigrationTask
 from kronos.executor.migrate import MigrationRunner
 
 
@@ -23,6 +23,7 @@ def _make_task(**overrides: object) -> MigrationTask:
         "from_host": "host-a",
         "to_host": "host-b",
         "improvement": 0.1,
+        "phase": MigrationPhase.SPREAD,
     }
     defaults.update(overrides)
     return MigrationTask(**defaults)

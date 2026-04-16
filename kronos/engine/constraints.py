@@ -171,8 +171,15 @@ class ConstraintChecker:
             return False
         return True
 
+    def get_groups(self) -> list[ServerGroup]:
+        """Fetch and cache relevant server groups from Nova.
+
+        Shared with the affinity enforcer; both need the parsed group
+        list and it is cheaper to fetch it once per cycle.
+        """
+        return self._get_groups()
+
     def _get_groups(self) -> list[ServerGroup]:
-        """Fetch and cache relevant server groups from Nova."""
         if self._groups is not None:
             return self._groups
 
