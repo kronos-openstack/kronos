@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kronos.engine.cooldown import QUARANTINE_FOREVER
 from kronos.engine.loop import EngineLoop
 from kronos.engine.types import (
     AggregateResult,
@@ -16,6 +17,7 @@ from kronos.engine.types import (
     MigrationPlan,
     MigrationStep,
     PolicyResult,
+    VmProfile,
 )
 from kronos.policies.models import PoliciesConfig, PolicyConfig, PolicyMode
 
@@ -146,6 +148,51 @@ class TestRunCycle:
 
         assert r1.cycle_number == 1
         assert r2.cycle_number == 2
+
+
+def _vm(uuid: str, host: str = "h1") -> VmProfile:
+    return VmProfile(instance_uuid=uuid, instance_name=uuid, host=host)
+
+
+class TestFilterUnavailableVms:
+    def test_passes_through_when_no_restrictions(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        profiles = {"vm-1": _vm("vm-1"), "vm-2": _vm("vm-2")}
+        kept = mock_engine._filter_unavailable_vms(profiles, "test-agg")
+        assert kept == profiles
+
+    def test_drops_quarantined(self, mock_engine: EngineLoop) -> None:
+        profiles = {"vm-1": _vm("vm-1"), "vm-bad": _vm("vm-bad")}
+        mock_engine._cooldown.quarantine_instance("vm-bad", QUARANTINE_FOREVER)
+        kept = mock_engine._filter_unavailable_vms(profiles, "test-agg")
+        assert "vm-bad" not in kept
+        assert "vm-1" in kept
+
+    def test_drops_cooling(self, mock_engine: EngineLoop) -> None:
+        profiles = {"vm-1": _vm("vm-1"), "vm-2": _vm("vm-2")}
+        mock_engine._cooldown.record_plan_emission("test-agg", ["vm-2"])
+        kept = mock_engine._filter_unavailable_vms(profiles, "test-agg")
+        assert "vm-2" not in kept
+        assert "vm-1" in kept
+
+    def test_drops_both_cooling_and_quarantined(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        profiles = {
+            "vm-ok": _vm("vm-ok"),
+            "vm-cool": _vm("vm-cool"),
+            "vm-q": _vm("vm-q"),
+        }
+        mock_engine._cooldown.record_plan_emission("test-agg", ["vm-cool"])
+        mock_engine._cooldown.quarantine_instance("vm-q", 600.0)
+        kept = mock_engine._filter_unavailable_vms(profiles, "test-agg")
+        assert set(kept) == {"vm-ok"}
+
+    def test_empty_input_returns_empty(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        assert mock_engine._filter_unavailable_vms({}, "test-agg") == {}
 
     def test_dry_run_flag_propagated(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())

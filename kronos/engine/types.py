@@ -176,6 +176,9 @@ class MigrationResult:
     """Outcome of a migration attempt, published by the executor.
 
     Engines (active and passive) listen for these to update cooldown state.
+    ``error_type`` carries the exception class name (PreFlightError,
+    MigrationFailed, MigrationTimeout, NovaClientError) when
+    ``success`` is False; it is empty on success.
     """
 
     task_id: str
@@ -186,6 +189,7 @@ class MigrationResult:
     to_host: str
     success: bool
     error: str = ""
+    error_type: str = ""
     duration_seconds: float = 0.0
     retry_count: int = 0
     completed_at: str = ""

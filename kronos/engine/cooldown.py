@@ -17,11 +17,14 @@ failover.
 
 from __future__ import annotations
 
+import math
 import time
 
 from oslo_log import log as logging
 
 LOG = logging.getLogger(__name__)
+
+QUARANTINE_FOREVER = -1
 
 
 class CooldownTracker:
@@ -38,6 +41,8 @@ class CooldownTracker:
         self._aggregate_emissions: dict[str, float] = {}
         # instance_uuid -> monotonic timestamp of last inclusion in a plan
         self._instance_emissions: dict[str, float] = {}
+        # instance_uuid -> monotonic expiry; math.inf means forever
+        self._instance_quarantine: dict[str, float] = {}
 
     def record_plan_emission(
         self,
@@ -73,6 +78,49 @@ class CooldownTracker:
             return False
         return (time.monotonic() - last) < self._instance_cooldown_seconds
 
+    def quarantine_instance(
+        self,
+        instance_uuid: str,
+        duration_seconds: float,
+    ) -> None:
+        """Mark an instance as quarantined after a definitive failure.
+
+        :param instance_uuid: UUID of the VM to skip.
+        :param duration_seconds: Quarantine duration. ``-1`` means
+            quarantine indefinitely (``math.inf``). Zero or negative
+            values other than ``-1`` are treated as no quarantine and
+            the call is a no-op.
+        """
+        if duration_seconds == QUARANTINE_FOREVER:
+            self._instance_quarantine[instance_uuid] = math.inf
+            LOG.info(
+                "Quarantining instance %s indefinitely",
+                instance_uuid,
+            )
+            return
+        if duration_seconds <= 0:
+            return
+        self._instance_quarantine[instance_uuid] = (
+            time.monotonic() + duration_seconds
+        )
+        LOG.info(
+            "Quarantining instance %s for %.0fs",
+            instance_uuid,
+            duration_seconds,
+        )
+
+    def is_instance_quarantined(self, instance_uuid: str) -> bool:
+        """True if the instance is under active quarantine."""
+        expiry = self._instance_quarantine.get(instance_uuid)
+        if expiry is None:
+            return False
+        if expiry == math.inf:
+            return True
+        if time.monotonic() >= expiry:
+            del self._instance_quarantine[instance_uuid]
+            return False
+        return True
+
     def update_from_result(
         self,
         aggregate: str,
@@ -90,7 +138,10 @@ class CooldownTracker:
         self._instance_emissions[instance_uuid] = now
 
     def cleanup_expired(self, max_age_seconds: float = 3600.0) -> None:
-        """Remove stale entries to prevent unbounded growth."""
+        """Remove stale entries to prevent unbounded growth.
+
+        Indefinite quarantines (``math.inf`` expiry) are preserved.
+        """
         now = time.monotonic()
         self._aggregate_emissions = {
             k: v for k, v in self._aggregate_emissions.items()
@@ -99,4 +150,8 @@ class CooldownTracker:
         self._instance_emissions = {
             k: v for k, v in self._instance_emissions.items()
             if (now - v) < max_age_seconds
+        }
+        self._instance_quarantine = {
+            k: v for k, v in self._instance_quarantine.items()
+            if v == math.inf or v > now
         }

@@ -24,8 +24,12 @@ Two oslo.messaging primitives, each for a reason:
   consumers. If there were ever two executors on the same topic
   (active + passive), only one would handle each task.
 - **Executor → Engines**: Notifications. Broadcast so that both
-  active and passive engines can update their cooldown state from
-  `migration.completed` / `migration.failed` events.
+  active and passive engines can update their cooldown and quarantine
+  state from `migration.completed` / `migration.failed` events. On
+  failure the payload carries `error_type` (exception class name) so
+  the engine can distinguish VM-specific failures (PreFlightError,
+  MigrationFailed, MigrationTimeout) from transient infrastructure
+  errors (NovaClientError).
 
 ## Message Flow
 ```

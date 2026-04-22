@@ -90,6 +90,7 @@ class MigrationRunner:
                 to_host=task.to_host,
                 success=False,
                 error=str(exc),
+                error_type=type(exc).__name__,
                 duration_seconds=duration,
                 retry_count=task.retry_count,
                 completed_at=datetime.now(tz=UTC).isoformat(),

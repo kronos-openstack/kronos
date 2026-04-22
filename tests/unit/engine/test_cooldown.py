@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import time
 
-from kronos.engine.cooldown import CooldownTracker
+from kronos.engine.cooldown import QUARANTINE_FOREVER, CooldownTracker
 
 
 def _tracker(
@@ -95,3 +96,64 @@ class TestCleanup:
         assert "old-vm" not in tracker._instance_emissions
         assert "fresh-agg" in tracker._aggregate_emissions
         assert "fresh-vm" in tracker._instance_emissions
+
+    def test_preserves_forever_quarantine(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-forever", QUARANTINE_FOREVER)
+        tracker.quarantine_instance("vm-short", 10.0)
+        tracker._instance_quarantine["vm-short"] = time.monotonic() - 1
+
+        tracker.cleanup_expired(max_age_seconds=3600.0)
+
+        assert tracker._instance_quarantine["vm-forever"] == math.inf
+        assert "vm-short" not in tracker._instance_quarantine
+
+
+class TestQuarantine:
+    def test_fresh_instance_not_quarantined(self) -> None:
+        tracker = _tracker()
+        assert not tracker.is_instance_quarantined("vm-1")
+
+    def test_recent_quarantine_is_active(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", 600.0)
+        assert tracker.is_instance_quarantined("vm-1")
+
+    def test_forever_quarantine_stays_active(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", QUARANTINE_FOREVER)
+        assert tracker.is_instance_quarantined("vm-1")
+        assert tracker._instance_quarantine["vm-1"] == math.inf
+
+    def test_expired_quarantine_cleared_on_read(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", 60.0)
+        tracker._instance_quarantine["vm-1"] = time.monotonic() - 1
+        assert not tracker.is_instance_quarantined("vm-1")
+        assert "vm-1" not in tracker._instance_quarantine
+
+    def test_zero_or_negative_duration_is_noop(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", 0)
+        tracker.quarantine_instance("vm-2", -5)
+        assert not tracker.is_instance_quarantined("vm-1")
+        assert not tracker.is_instance_quarantined("vm-2")
+
+    def test_forever_sentinel_beats_zero(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", QUARANTINE_FOREVER)
+        assert tracker.is_instance_quarantined("vm-1")
+
+    def test_re_quarantine_extends(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", 10.0)
+        first_expiry = tracker._instance_quarantine["vm-1"]
+        tracker.quarantine_instance("vm-1", 3600.0)
+        second_expiry = tracker._instance_quarantine["vm-1"]
+        assert second_expiry > first_expiry
+
+    def test_forever_quarantine_overrides_existing_timed(self) -> None:
+        tracker = _tracker()
+        tracker.quarantine_instance("vm-1", 10.0)
+        tracker.quarantine_instance("vm-1", QUARANTINE_FOREVER)
+        assert tracker._instance_quarantine["vm-1"] == math.inf

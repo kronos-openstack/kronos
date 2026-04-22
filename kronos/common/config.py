@@ -78,6 +78,16 @@ engine_opts = [
         help="Seconds after a VM is included in a plan before it can be re-planned.",
     ),
     cfg.IntOpt(
+        "instance_quarantine_seconds",
+        default=3600,
+        min=-1,
+        help=(
+            "Seconds to skip a VM after its migration definitively failed "
+            "(retries exhausted). Use -1 to quarantine indefinitely. "
+            "Applied on PreFlightError, MigrationFailed, and MigrationTimeout."
+        ),
+    ),
+    cfg.IntOpt(
         "cooldown",
         default=600,
         help=(

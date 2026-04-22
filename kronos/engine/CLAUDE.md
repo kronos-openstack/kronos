@@ -15,8 +15,9 @@ It never calls Nova live-migrate directly.
 - `planner.py` — Planner: combined-scoring simulation (spread greedy + pack First Fit Decreasing)
 - `constraints.py` — ConstraintChecker: validates moves against all four Nova server group placement policies (affinity, anti-affinity, soft-affinity, soft-anti-affinity)
 - `affinity_enforcer.py` — AffinityEnforcer: repair pass that moves VMs out of existing server-group violations, using the same combined-imbalance math to pick destinations
-- `cooldown.py` — CooldownTracker: aggregate-level and instance-level cooldowns
-- `loop.py` — EngineLoop: periodic per-aggregate evaluation cycle, plan emission via RPC cast
+- `cooldown.py` — CooldownTracker: aggregate-level cooldown, instance-level cooldown, and post-failure quarantine
+- `result_listener.py` — MigrationResultEndpoint: oslo.messaging notification endpoint that consumes migration.completed / migration.failed events and drives quarantine
+- `loop.py` — EngineLoop: periodic per-aggregate evaluation cycle, plan emission via RPC cast, result-listener lifecycle
 
 ## Scope Resolution
 The engine operates on a fixed set of aggregates defined at startup via
@@ -65,11 +66,19 @@ oslo.config → EngineLoop
                 │       │   ├── spread: greedy best-move-per-round minimising combined imbalance
                 │       │   └── pack: First Fit Decreasing, combined utilization for ordering
                 │       │
+                │       ├── _filter_unavailable_vms(vm_profiles)         — drop quarantined + cooling VMs
+                │       │
                 │       └── if not dry_run and plan has steps:
                 │           ├── for each step: RPCClient.cast('execute_migration', task)
                 │           └── CooldownTracker.record_plan_emission(aggregate, instance_uuids)
                 │
                 └── log CycleReport (aggregate results, per-policy imbalances, plans)
+
+In parallel, a notification listener per aggregate consumes results:
+  kronos.results.<aggregate> → MigrationResultEndpoint.info()
+                               ├── migration.completed            — DEBUG log
+                               ├── migration.failed (retry pending)— DEBUG log
+                               └── migration.failed (final)        — INFO log, quarantine_instance()
 ```
 
 ## Combined Scoring
@@ -250,19 +259,53 @@ The CooldownTracker prevents oscillation and migration storms:
 - **Instance-level**: after including a VM in a plan, skip it for
   `engine.instance_cooldown` seconds. Prevents a VM bouncing between
   hosts via different migrations.
+- **Quarantine**: after a migration definitively fails (retries
+  exhausted on PreFlightError / MigrationFailed / MigrationTimeout),
+  skip the VM for `engine.instance_quarantine_seconds`. Use `-1` for
+  indefinite quarantine. NovaClientError is treated as transient and
+  does not quarantine; the normal instance cooldown governs re-planning.
 
-Active and passive engines both maintain a tracker. The passive engine
-listens on `kronos.results.<aggregate>` and updates its own cooldown
-state from `migration.completed` / `migration.failed` notifications, so
-it has warm state on failover.
+`EngineLoop._filter_unavailable_vms` is the single chokepoint that
+enforces both instance cooldown and quarantine: it runs immediately
+after `VmProfiler.collect()` and drops excluded UUIDs from the
+`vm_profiles` dict before the enforcer and planner see it. The scorer
+still computes per-host imbalance from fresh Prometheus data — only
+the *candidate set for movement* is filtered.
+
+## Result Listener
+
+`MigrationResultEndpoint` ([`result_listener.py`](result_listener.py))
+subscribes to `kronos.results.<aggregate>` and reacts per event type:
+
+| Event | Condition | Action |
+|---|---|---|
+| `migration.completed` | — | DEBUG log, no state change |
+| `migration.failed` | `retry_count < max_retries` (retry pending) | DEBUG log, no state change |
+| `migration.failed` | final attempt, `error_type` in `{PreFlightError, MigrationFailed, MigrationTimeout}` | INFO log, `quarantine_instance(uuid, instance_quarantine_seconds)` |
+| `migration.failed` | final attempt, `error_type == NovaClientError` | INFO log; no quarantine (transient infra error) |
+| `migration.failed` | final attempt, unknown `error_type` | INFO log, defensive quarantine |
+
+`EngineLoop._init_messaging` creates one notification listener per
+aggregate (plus one for the unassigned pool) using
+`get_notification_listener()`. Listeners are started before the loop
+begins and drained in `_shutdown_messaging()` on SIGTERM/SIGINT.
+
+Listeners are only wired when `dry_run=false`. In dry-run, no plans
+are cast so no results ever arrive.
+
+Active and passive engines both run the endpoint — the passive engine
+stays warm with the same quarantine and cooldown state so it can take
+over without dropping context (full active-passive HA lands in M4).
 
 ## EngineLoop Lifecycle
 1. Load oslo.config + policies YAML
 2. Resolve aggregate scope from `[engine] aggregates` and `include_unassigned_hosts`
 3. Initialise Prometheus client, Nova client, scorer, profiler, constraints, planner, cooldown
-4. If `dry_run=false`: create RPC transport and per-aggregate RPC clients
-5. Enter loop: for each aggregate → score → cooldown check → profile → plan → cast → log
-6. Handle SIGTERM/SIGINT for graceful shutdown
+4. If `dry_run=false`: create RPC transport + per-aggregate RPC clients, and a
+   notification transport + per-aggregate result listeners
+5. Enter loop: for each aggregate → score → cooldown check → profile →
+   filter unavailable VMs → plan → cast → log
+6. Handle SIGTERM/SIGINT for graceful shutdown (drains result listeners)
 7. Constraint cache invalidated each cycle
 
 ## Logging

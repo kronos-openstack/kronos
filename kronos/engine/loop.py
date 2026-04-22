@@ -26,9 +26,12 @@ from oslo_log import log as logging
 from kronos.clients.nova import NovaClient
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.messaging import (
+    get_notification_listener,
+    get_notification_transport,
     get_rpc_client,
     get_rpc_transport,
     migrations_topic,
+    results_topic,
     task_to_dict,
 )
 from kronos.engine.affinity_enforcer import AffinityEnforcer
@@ -36,6 +39,7 @@ from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
+from kronos.engine.result_listener import MigrationResultEndpoint
 from kronos.engine.scorer import PolicyScorer
 from kronos.engine.types import (
     AggregateResult,
@@ -43,6 +47,7 @@ from kronos.engine.types import (
     MigrationPlan,
     MigrationTask,
     PolicyResult,
+    VmProfile,
 )
 from kronos.policies.loader import load_policies
 from kronos.policies.models import PoliciesConfig, PolicyConfig
@@ -77,6 +82,10 @@ class EngineLoop:
         # Keys: aggregate name, or None for the unassigned-hosts pool.
         self._rpc_clients: dict[str | None, oslo_messaging.RPCClient] = {}
         self._rpc_transport: oslo_messaging.Transport | None = None
+
+        # Result listener state (one listener per aggregate).
+        self._notification_transport: oslo_messaging.Transport | None = None
+        self._result_listeners: list[oslo_messaging.MessageHandlingServer] = []
 
     def start(self) -> None:
         """Start the evaluation loop.  Blocks until stopped."""
@@ -113,11 +122,62 @@ class EngineLoop:
             if self._running:
                 time.sleep(interval)
 
+        self._shutdown_messaging()
         LOG.info("Engine loop stopped after %d cycles.", self._cycle_count)
 
     def stop(self) -> None:
         """Signal the loop to stop after the current cycle."""
         self._running = False
+
+    def _shutdown_messaging(self) -> None:
+        """Stop and drain the result listeners."""
+        for listener in self._result_listeners:
+            try:
+                listener.stop()
+                listener.wait()
+            except Exception as exc:
+                LOG.warning("Error while stopping result listener: %s", exc)
+        self._result_listeners.clear()
+
+    def _filter_unavailable_vms(
+        self,
+        vm_profiles: dict[str, VmProfile],
+        aggregate: str,
+    ) -> dict[str, VmProfile]:
+        """Drop VMs currently under quarantine or instance cooldown.
+
+        Both states mean "do not plan a migration for this VM right now":
+
+        - Quarantine: the VM's migration definitively failed recently
+          (final attempt hit PreFlightError / MigrationFailed /
+          MigrationTimeout); skip until the quarantine expires.
+        - Instance cooldown: the VM was included in a recently emitted
+          plan; skip until ``instance_cooldown`` elapses to prevent the
+          VM from bouncing between hosts.
+        """
+        kept: dict[str, VmProfile] = {}
+        quarantined: list[str] = []
+        cooling: list[str] = []
+        for instance_uuid, profile in vm_profiles.items():
+            if self._cooldown.is_instance_quarantined(instance_uuid):
+                quarantined.append(instance_uuid)
+                continue
+            if self._cooldown.is_instance_cooling(instance_uuid):
+                cooling.append(instance_uuid)
+                continue
+            kept[instance_uuid] = profile
+
+        if quarantined or cooling:
+            LOG.debug(
+                "Aggregate '%s': excluded %d quarantined and %d cooling VMs "
+                "from planning (quarantined=%s, cooling=%s)",
+                aggregate,
+                len(quarantined),
+                len(cooling),
+                quarantined,
+                cooling,
+            )
+        return kept
 
     def _resolve_aggregates(self) -> list[str | None]:
         """Build the list of aggregate names (and optional None for unassigned)."""
@@ -127,7 +187,7 @@ class EngineLoop:
         return result
 
     def _init_messaging(self, aggregates: list[str | None]) -> None:
-        """Create one RPC client per aggregate (or for the unassigned pool)."""
+        """Wire RPC clients (outbound) and result listeners (inbound)."""
         self._rpc_transport = get_rpc_transport(self._conf)
         for aggregate in aggregates:
             self._rpc_clients[aggregate] = get_rpc_client(
@@ -137,6 +197,21 @@ class EngineLoop:
                 "RPC client ready for topic '%s'",
                 migrations_topic(aggregate),
             )
+
+        self._notification_transport = get_notification_transport(self._conf)
+        endpoint = MigrationResultEndpoint(
+            cooldown=self._cooldown,
+            max_retries=self._conf.executor.max_retries,
+            quarantine_seconds=self._conf.engine.instance_quarantine_seconds,
+        )
+        for aggregate in aggregates:
+            topic = results_topic(aggregate)
+            listener = get_notification_listener(
+                self._notification_transport, topic, [endpoint],
+            )
+            listener.start()
+            self._result_listeners.append(listener)
+            LOG.info("Result listener ready on topic '%s'", topic)
 
     def _run_cycle(
         self,
@@ -243,6 +318,7 @@ class EngineLoop:
             hosts=hosts,
             host_scores_by_policy=host_scores_by_policy,
         )
+        vm_profiles = self._filter_unavailable_vms(vm_profiles, name)
         result.vm_profiles = vm_profiles
 
         if not vm_profiles:

@@ -61,7 +61,8 @@ them out through the Nova live-migrate API.
    combined imbalance and never cross a policy threshold. Repair and
    imbalance moves share a single `max_migrations_per_cycle` budget.
 7. **Cooldown tracker** prevents oscillation via aggregate-level and
-   instance-level cooldowns.
+   instance-level cooldowns, and quarantines VMs whose migration has
+   definitively failed so the planner stops re-proposing them.
 8. **Executor** consumes migration tasks, validates pre-flight state, calls
    Nova live-migrate, polls until completion, and verifies post-flight.
 
@@ -115,6 +116,11 @@ include_unassigned_hosts = false
 # Cooldowns (seconds)
 cooldown = 600
 instance_cooldown = 900
+
+# Quarantine window applied to a VM after its migration definitively
+# failed (retries exhausted with PreFlightError / MigrationFailed /
+# MigrationTimeout). Use -1 for indefinite quarantine.
+instance_quarantine_seconds = 3600
 
 # Optional: repair existing server-group violations every cycle.
 # Both off by default.
@@ -249,7 +255,11 @@ evaluates all enabled policies against each aggregate every cycle:
 6. **Cast** — send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
    task carries a `phase` field (`affinity`, `spread`, or `pack`) that surfaces in
    logs so operators can see why each migration was proposed
-7. **Cooldown** — enforce aggregate-level and instance-level cooldown
+7. **Cooldown** — record aggregate-level and instance-level cooldown on plan
+   emission; skip VMs already in cooldown or quarantine on the next cycle
+8. **Result listener** — subscribe to `kronos.results.<aggregate>`, quarantine
+   VMs on a definitive failure (PreFlightError, MigrationFailed,
+   MigrationTimeout) so the planner stops re-proposing them
 
 ### Executor (migration runner)
 
@@ -268,7 +278,7 @@ One executor per aggregate consumes tasks from RabbitMQ:
 | Topic | Primitive | Publisher | Consumer |
 |-------|-----------|-----------|----------|
 | `kronos.migrations.<aggregate>` | RPC cast | Engine | Executor (competing consumers) |
-| `kronos.results.<aggregate>` | Notification | Executor | Engines (broadcast to active + passive for cooldown tracking) |
+| `kronos.results.<aggregate>` | Notification | Executor | Engines (broadcast: active + passive update cooldown and quarantine state) |
 
 The unassigned-hosts pool uses the reserved name `_unassigned_` in its topics.
 
@@ -337,7 +347,6 @@ Independent named milestones (any order):
 | Name | Scope |
 |------|-------|
 | Pack-rework | Pack mode redesign + compactor parity (`post_drain_action`, `ha_reserve`, host re-enable) |
-| Executor-timeout | Drop the executor's migration timeout and rely on Nova's |
 | Executor-multi-aggregate | One executor process can service multiple aggregates (one thread per topic) |
 
 ## License
