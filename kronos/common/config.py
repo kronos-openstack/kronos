@@ -25,7 +25,7 @@ executor_opts = [
     ),
     cfg.IntOpt(
         "migration_timeout",
-        default=1800,
+        default=600,
         min=60,
         help="Timeout in seconds for a single live migration.",
     ),

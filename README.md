@@ -138,7 +138,7 @@ transport_url = rabbit://guest:guest@localhost:5672/
 
 [executor]
 max_concurrent_migrations = 2
-migration_timeout = 1800
+migration_timeout = 600
 max_retries = 3
 stagger_seconds = 30
 ```
