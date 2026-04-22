@@ -307,6 +307,7 @@ class EngineLoop:
         stagger = self._conf.executor.stagger_seconds
         base_time = time.time()
 
+        total = len(plan.steps)
         for i, step in enumerate(plan.steps):
             task = MigrationTask.from_step(
                 step=step,
@@ -318,14 +319,15 @@ class EngineLoop:
             )
             client.cast({}, "execute_migration", task=task_to_dict(task))
             LOG.info(
-                "Cast migration task %s [%s]: %s (%s) %s -> %s "
-                "(plan=%s, not_before=+%ds)",
-                task.task_id[:8],
-                step.phase.value.upper(),
+                "Dispatched move %d/%d (%s): %s (%s) %s -> %s [task %s, plan %s, starts in %ds]",
+                i + 1,
+                total,
+                step.phase.value,
                 step.instance_name,
                 step.instance_uuid[:8],
                 step.from_host,
                 step.to_host,
+                task.task_id[:8],
                 plan_id[:8],
                 i * stagger,
             )
@@ -334,7 +336,7 @@ class EngineLoop:
         duration = (report.completed_at - report.started_at).total_seconds()
 
         LOG.info(
-            "Cycle #%d completed in %.1fs: %d aggregates, %d errors",
+            "Cycle %d finished in %.1fs (%d aggregates, %d errors)",
             report.cycle_number,
             duration,
             len(report.aggregate_results),
@@ -348,34 +350,37 @@ class EngineLoop:
     def _log_aggregate_result(ar: AggregateResult) -> None:
         if ar.imbalance_detected:
             LOG.info(
-                "  [IMBALANCE] %s: combined=%.3f",
+                "Aggregate '%s': combined imbalance %.3f, above threshold",
                 ar.aggregate,
                 ar.combined_imbalance,
             )
         else:
             LOG.info(
-                "  [OK] %s: combined=%.3f (within thresholds)",
+                "Aggregate '%s': combined imbalance %.3f, within thresholds",
                 ar.aggregate,
                 ar.combined_imbalance,
             )
 
+        name_width = max(
+            (len(pr.policy_name) for pr in ar.policy_results),
+            default=0,
+        )
         for pr in ar.policy_results:
             if pr.skipped:
-                LOG.info("    [SKIP] %s: %s", pr.policy_name, pr.skip_reason)
+                LOG.info(
+                    "  policy %-*s skipped (%s)",
+                    name_width, pr.policy_name, pr.skip_reason,
+                )
                 continue
-            marker = "⚠" if pr.imbalance_detected else " "
+            suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
             LOG.info(
-                "    %s %s: imbalance=%.3f",
-                marker,
-                pr.policy_name,
-                pr.imbalance,
+                "  policy %-*s imbalance %.3f%s",
+                name_width, pr.policy_name, pr.imbalance, suffix,
             )
             for hs in pr.host_scores:
                 LOG.debug(
-                    "        %s: raw=%.3f normalized=%.3f",
-                    hs.host,
-                    hs.raw_score,
-                    hs.normalized_score,
+                    "    host %s raw=%.3f normalized=%.3f",
+                    hs.host, hs.raw_score, hs.normalized_score,
                 )
 
         EngineLoop._log_migration_plan(ar.migration_plan)
@@ -386,16 +391,16 @@ class EngineLoop:
             return
 
         LOG.info(
-            "    Migration plan: %d steps, combined %.3f -> %.3f (projected)",
+            "  Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
             plan.migration_count,
             plan.initial_imbalance,
             plan.projected_imbalance,
         )
         for i, step in enumerate(plan.steps, 1):
             LOG.info(
-                "    [%d][%s] %s (%s): %s -> %s (improvement=%.3f)",
+                "    %d. %-8s %s (%s) %s -> %s, gain %.3f",
                 i,
-                step.phase.value.upper(),
+                step.phase.value,
                 step.instance_name,
                 step.instance_uuid[:8],
                 step.from_host,

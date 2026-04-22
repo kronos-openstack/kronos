@@ -151,16 +151,15 @@ class AffinityEnforcer:
                 # and stop; imbalance planner still gets the remaining
                 # budget.
                 LOG.warning(
-                    "[AFFINITY] aggregate=%s %d violation(s) could not be "
-                    "repaired without crossing policy thresholds",
+                    "Affinity repair in '%s': %d violation(s) cannot be "
+                    "repaired without breaching policy thresholds",
                     aggregate,
                     len(violations),
                 )
                 break
 
             LOG.info(
-                "[AFFINITY] aggregate=%s move %s (%s) %s -> %s "
-                "(combined %.3f -> %.3f)",
+                "Affinity repair in '%s': %s (%s) %s -> %s, combined imbalance %.3f -> %.3f",
                 aggregate,
                 step.instance_name,
                 step.instance_uuid[:8],

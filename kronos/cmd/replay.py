@@ -177,17 +177,25 @@ def _run_replay(
 
         combined_imbalance = 0.0
         any_detected = False
+        name_width = max(
+            (len(pr.policy_name) for pr in policy_results),
+            default=0,
+        )
         for policy, pr in zip(enabled, policy_results, strict=True):
             if pr.skipped:
-                LOG.info("  [SKIP] %s: %s", pr.policy_name, pr.skip_reason)
+                LOG.info(
+                    "  policy %-*s skipped (%s)",
+                    name_width, pr.policy_name, pr.skip_reason,
+                )
                 continue
             combined_imbalance += policy.weight * pr.imbalance
             if pr.imbalance_detected:
                 any_detected = True
-            marker = "⚠" if pr.imbalance_detected else " "
+            suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
             LOG.info(
-                "  %s %s: imbalance=%.3f (threshold=%.3f)",
-                marker, pr.policy_name, pr.imbalance, policy.threshold,
+                "  policy %-*s imbalance %.3f (threshold %.3f)%s",
+                name_width, pr.policy_name, pr.imbalance,
+                policy.threshold, suffix,
             )
 
         LOG.info("  Combined imbalance: %.3f", combined_imbalance)
@@ -200,7 +208,7 @@ def _run_replay(
             if not pr.skipped
         ]
         if not active:
-            LOG.info("  No active policies — cannot plan.")
+            LOG.info("  No active policies, cannot plan.")
             continue
         active_policies = [p for p, _ in active]
         active_results = [pr for _, pr in active]
@@ -218,7 +226,7 @@ def _run_replay(
         totals["profiler"] += time.perf_counter() - t0
 
         if not vm_profiles:
-            LOG.info("  No VM profiles collected — cannot plan.")
+            LOG.info("  No VM profiles collected, cannot plan.")
             continue
 
         budget = max(p.max_migrations_per_cycle for p in active_policies)
@@ -266,15 +274,16 @@ def _log_plan(plan: MigrationPlan) -> None:
         return
 
     LOG.info(
-        "  Migration plan: %d steps, combined %.3f -> %.3f",
+        "  Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
         plan.migration_count,
         plan.initial_imbalance,
         plan.projected_imbalance,
     )
     for i, step in enumerate(plan.steps, 1):
         LOG.info(
-            "    [%d] %s (%s): %s -> %s (improvement=%.4f)",
+            "    %d. %-8s %s (%s) %s -> %s, gain %.4f",
             i,
+            step.phase.value,
             step.instance_name,
             step.instance_uuid[:8],
             step.from_host,
