@@ -238,5 +238,18 @@ def main() -> int:
     _record_nova(nova, aggregate_names, output_dir)
     _record_prometheus(prometheus, policies, output_dir)
 
+    # Empty cooldown template — operators edit this to reproduce
+    # specific cooldown / quarantine scenarios in kronos-replay.
+    (output_dir / "cooldowns.json").write_text(
+        json.dumps(
+            {
+                "aggregate_cooldowns": {},
+                "instance_cooldowns": {},
+                "instance_quarantines": {},
+            },
+            indent=2,
+        ) + "\n",
+    )
+
     LOG.info("Snapshot written to %s", output_dir)
     return 0

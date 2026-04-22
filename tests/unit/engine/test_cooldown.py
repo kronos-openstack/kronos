@@ -157,3 +157,54 @@ class TestQuarantine:
         tracker.quarantine_instance("vm-1", 10.0)
         tracker.quarantine_instance("vm-1", QUARANTINE_FOREVER)
         assert tracker._instance_quarantine["vm-1"] == math.inf
+
+
+class TestSeed:
+    def test_seed_aggregate_cooldown_activates_it(self) -> None:
+        tracker = _tracker(aggregate_cd=600.0)
+        tracker.seed_aggregate_cooldown("gpu", 120.0)
+        assert tracker.is_aggregate_cooling("gpu")
+
+    def test_seed_aggregate_cooldown_clamped_to_configured(self) -> None:
+        tracker = _tracker(aggregate_cd=600.0)
+        tracker.seed_aggregate_cooldown("gpu", 9999.0)
+        # Still cooling, but the oldest possible — effective remaining
+        # is configured.
+        assert tracker.is_aggregate_cooling("gpu")
+        elapsed = time.monotonic() - tracker._aggregate_emissions["gpu"]
+        assert elapsed < 1.0  # emission ~= now
+
+    def test_seed_aggregate_zero_is_noop(self) -> None:
+        tracker = _tracker()
+        tracker.seed_aggregate_cooldown("gpu", 0.0)
+        assert not tracker.is_aggregate_cooling("gpu")
+
+    def test_seed_aggregate_negative_is_noop(self) -> None:
+        tracker = _tracker()
+        tracker.seed_aggregate_cooldown("gpu", -5.0)
+        assert not tracker.is_aggregate_cooling("gpu")
+
+    def test_seed_instance_cooldown_activates_it(self) -> None:
+        tracker = _tracker(instance_cd=900.0)
+        tracker.seed_instance_cooldown("vm-1", 300.0)
+        assert tracker.is_instance_cooling("vm-1")
+
+    def test_seed_instance_cooldown_zero_is_noop(self) -> None:
+        tracker = _tracker()
+        tracker.seed_instance_cooldown("vm-1", 0)
+        assert not tracker.is_instance_cooling("vm-1")
+
+    def test_seed_quarantine_timed(self) -> None:
+        tracker = _tracker()
+        tracker.seed_instance_quarantine("vm-1", 1800.0)
+        assert tracker.is_instance_quarantined("vm-1")
+
+    def test_seed_quarantine_forever(self) -> None:
+        tracker = _tracker()
+        tracker.seed_instance_quarantine("vm-1", QUARANTINE_FOREVER)
+        assert tracker._instance_quarantine["vm-1"] == math.inf
+
+    def test_seed_quarantine_zero_is_noop(self) -> None:
+        tracker = _tracker()
+        tracker.seed_instance_quarantine("vm-1", 0)
+        assert not tracker.is_instance_quarantined("vm-1")

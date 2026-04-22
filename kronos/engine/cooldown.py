@@ -137,6 +137,53 @@ class CooldownTracker:
         self._aggregate_emissions[aggregate] = now
         self._instance_emissions[instance_uuid] = now
 
+    def seed_aggregate_cooldown(
+        self,
+        aggregate: str,
+        seconds_remaining: float,
+    ) -> None:
+        """Seed the aggregate cooldown with a remaining-time value.
+
+        Used by ``kronos-replay`` to preload state captured outside the
+        engine.  ``seconds_remaining`` is clamped to
+        ``aggregate_cooldown_seconds`` since a larger value would imply
+        an emission in the future.
+        """
+        if seconds_remaining <= 0:
+            return
+        remaining = min(seconds_remaining, self._aggregate_cooldown_seconds)
+        self._aggregate_emissions[aggregate] = (
+            time.monotonic() - (self._aggregate_cooldown_seconds - remaining)
+        )
+
+    def seed_instance_cooldown(
+        self,
+        instance_uuid: str,
+        seconds_remaining: float,
+    ) -> None:
+        """Seed the instance cooldown with a remaining-time value."""
+        if seconds_remaining <= 0:
+            return
+        remaining = min(seconds_remaining, self._instance_cooldown_seconds)
+        self._instance_emissions[instance_uuid] = (
+            time.monotonic() - (self._instance_cooldown_seconds - remaining)
+        )
+
+    def seed_instance_quarantine(
+        self,
+        instance_uuid: str,
+        seconds_remaining: float,
+    ) -> None:
+        """Seed a quarantine expiry. ``-1`` means indefinite."""
+        if seconds_remaining == QUARANTINE_FOREVER:
+            self._instance_quarantine[instance_uuid] = math.inf
+            return
+        if seconds_remaining <= 0:
+            return
+        self._instance_quarantine[instance_uuid] = (
+            time.monotonic() + seconds_remaining
+        )
+
     def cleanup_expired(self, max_age_seconds: float = 3600.0) -> None:
         """Remove stale entries to prevent unbounded growth.
 

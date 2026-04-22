@@ -23,10 +23,11 @@ from kronos.common.exceptions import AggregateNotFound
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
 from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
+from kronos.engine.cooldown import CooldownTracker
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.scorer import PolicyScorer
-from kronos.engine.types import MigrationPlan
+from kronos.engine.types import MigrationPlan, VmProfile
 from kronos.policies.loader import load_policies
 
 CONF = cfg.CONF
@@ -131,6 +132,7 @@ def _run_replay(
     enforce_hard: bool,
     enforce_soft: bool,
     show_timings: bool,
+    cooldown: CooldownTracker,
 ) -> int:
     """Run a single engine cycle against snapshot data."""
     nova = ReplayNovaClient(snapshot_dir)
@@ -169,6 +171,10 @@ def _run_replay(
         hosts = nova.get_hosts_in_aggregate(aggregate)
         if not hosts:
             LOG.info("  No hosts recorded, skipping.")
+            continue
+
+        if cooldown.is_aggregate_cooling(name):
+            LOG.info("  Aggregate '%s' is cooling, skipping planning.", name)
             continue
 
         t0 = time.perf_counter()
@@ -225,6 +231,8 @@ def _run_replay(
         )
         totals["profiler"] += time.perf_counter() - t0
 
+        vm_profiles = _filter_unavailable(vm_profiles, cooldown, name)
+
         if not vm_profiles:
             LOG.info("  No VM profiles collected, cannot plan.")
             continue
@@ -266,6 +274,75 @@ def _run_replay(
         LOG.info("  %-10s %.3fs  (100.0%%)", "total", total)
 
     return 0
+
+
+def _filter_unavailable(
+    vm_profiles: dict[str, VmProfile],
+    cooldown: CooldownTracker,
+    aggregate: str,
+) -> dict[str, VmProfile]:
+    """Drop VMs currently in instance cooldown or quarantine."""
+    kept: dict[str, VmProfile] = {}
+    skipped: list[str] = []
+    for instance_uuid, profile in vm_profiles.items():
+        if cooldown.is_instance_quarantined(instance_uuid):
+            skipped.append(f"{instance_uuid}=quarantined")
+            continue
+        if cooldown.is_instance_cooling(instance_uuid):
+            skipped.append(f"{instance_uuid}=cooling")
+            continue
+        kept[instance_uuid] = profile
+    if skipped:
+        LOG.info(
+            "  Excluded %d VM(s) from planning in '%s': %s",
+            len(skipped),
+            aggregate,
+            ", ".join(skipped),
+        )
+    return kept
+
+
+def _load_cooldowns(
+    snapshot_dir: Path,
+    tracker: CooldownTracker,
+) -> None:
+    """Seed the tracker from ``<snapshot>/cooldowns.json`` if present.
+
+    File shape:
+
+    ```json
+    {
+      "aggregate_cooldowns":  {"gpu": 120},
+      "instance_cooldowns":   {"vm-abc": 300},
+      "instance_quarantines": {"vm-xyz": 1800, "vm-banned": -1}
+    }
+    ```
+
+    All sections are optional.  Values are seconds remaining at replay
+    time; ``-1`` in ``instance_quarantines`` means indefinite.
+    """
+    path = snapshot_dir / "cooldowns.json"
+    if not path.exists():
+        return
+
+    data = json.loads(path.read_text())
+
+    for aggregate, remaining in data.get("aggregate_cooldowns", {}).items():
+        tracker.seed_aggregate_cooldown(aggregate, float(remaining))
+    for instance_uuid, remaining in data.get("instance_cooldowns", {}).items():
+        tracker.seed_instance_cooldown(instance_uuid, float(remaining))
+    for instance_uuid, remaining in data.get(
+        "instance_quarantines", {},
+    ).items():
+        tracker.seed_instance_quarantine(instance_uuid, float(remaining))
+
+    LOG.info(
+        "Seeded cooldowns from %s: %d aggregate, %d instance, %d quarantine",
+        path,
+        len(data.get("aggregate_cooldowns", {})),
+        len(data.get("instance_cooldowns", {})),
+        len(data.get("instance_quarantines", {})),
+    )
 
 
 def _log_plan(plan: MigrationPlan) -> None:
@@ -337,10 +414,17 @@ def main() -> int:
             len(meta.get("policy_names", [])),
         )
 
+    cooldown = CooldownTracker(
+        aggregate_cooldown_seconds=float(CONF.engine.cooldown),
+        instance_cooldown_seconds=float(CONF.engine.instance_cooldown),
+    )
+    _load_cooldowns(snapshot_dir, cooldown)
+
     return _run_replay(
         snapshot_dir,
         CONF.engine.policies_file,
         enforce_hard=CONF.engine.enforce_hard_affinity,
         enforce_soft=CONF.engine.enforce_soft_affinity,
         show_timings=CONF["time"],
+        cooldown=cooldown,
     )

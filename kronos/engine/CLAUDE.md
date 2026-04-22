@@ -297,6 +297,32 @@ Active and passive engines both run the endpoint — the passive engine
 stays warm with the same quarantine and cooldown state so it can take
 over without dropping context (full active-passive HA lands in M4).
 
+## Replay Cooldown Seeding
+
+`kronos-replay` can seed the tracker from `<snapshot>/cooldowns.json`
+so offline runs reproduce scenarios where specific VMs are already
+cooling or quarantined.  The file is optional and has three optional
+sections:
+
+```json
+{
+  "aggregate_cooldowns":  {"gpu": 120},
+  "instance_cooldowns":   {"vm-abc": 300},
+  "instance_quarantines": {"vm-xyz": 1800, "vm-banned": -1}
+}
+```
+
+Values are seconds remaining at replay time.  ``-1`` in
+``instance_quarantines`` means indefinite.  ``kronos-record`` writes
+an empty template; operators edit it to stage test scenarios.
+
+Seeding uses `CooldownTracker.seed_aggregate_cooldown`,
+`seed_instance_cooldown`, and `seed_instance_quarantine`.  The
+aggregate and instance cooldowns are clamped to the configured
+durations so a snapshot claiming more seconds remaining than
+`[engine] cooldown` / `instance_cooldown` degrades to the configured
+max rather than erroring.
+
 ## EngineLoop Lifecycle
 1. Load oslo.config + policies YAML
 2. Resolve aggregate scope from `[engine] aggregates` and `include_unassigned_hosts`
