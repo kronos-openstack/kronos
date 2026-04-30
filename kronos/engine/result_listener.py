@@ -9,11 +9,13 @@ engine state per the agreed matrix:
 - ``migration.failed`` at the last attempt: info log, and for
   PreFlightError / MigrationFailed / MigrationTimeout the instance is
   quarantined for ``instance_quarantine_seconds``.  NovaClientError is
-  treated as transient — no quarantine, the regular instance cooldown
+  treated as transient - no quarantine, the regular instance cooldown
   governs when the VM may be re-planned.
 """
 
 from __future__ import annotations
+
+from typing import cast
 
 from oslo_log import log as logging
 
@@ -26,7 +28,7 @@ LOG = logging.getLogger(__name__)
 QUARANTINE_ERROR_TYPES = frozenset(
     {"PreFlightError", "MigrationFailed", "MigrationTimeout"},
 )
-# Transient infrastructure errors — no quarantine, just let the normal
+# Transient infrastructure errors - no quarantine, just let the normal
 # instance cooldown take effect.
 TRANSIENT_ERROR_TYPES = frozenset({"NovaClientError"})
 
@@ -78,7 +80,7 @@ class MigrationResultEndpoint:
         )
 
     def _on_failed(self, payload: dict[str, object]) -> None:
-        retry_count = int(payload.get("retry_count", 0) or 0)
+        retry_count = cast(int, payload.get("retry_count") or 0)
         if retry_count < self._max_retries:
             LOG.debug(
                 "Migration failed (retry pending): task=%s instance=%s "

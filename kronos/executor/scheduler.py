@@ -5,7 +5,7 @@ runner.  It accepts tasks immediately (so the consumer can ack), holds
 them in a priority queue sorted by ``not_before``, and dispatches them
 to worker threads when their time arrives and a concurrency slot is free.
 
-On executor restart, queued tasks are lost — the engine re-plans next cycle.
+On executor restart, queued tasks are lost - the engine re-plans next cycle.
 """
 
 from __future__ import annotations

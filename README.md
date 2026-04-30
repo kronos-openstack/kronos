@@ -73,7 +73,7 @@ them out through the Nova live-migrate API.
 - Python 3.12+
 - OpenStack cloud with Nova and Keystone
 - Prometheus with host-level metrics (e.g., `node_exporter`, `libvirt_exporter`)
-- RabbitMQ — the existing OpenStack broker; only needed when `dry_run = false`
+- RabbitMQ - the existing OpenStack broker; only needed when `dry_run = false`
 
 ### Install
 
@@ -232,8 +232,8 @@ kronos-replay --config-file /etc/kronos/kronos.conf /tmp/snapshot
 
 | Mode | Behavior |
 |------|----------|
-| `spread` | Balance load evenly across hosts — greedy combined-score simulation picks the best single move per round |
-| `pack` | Consolidate VMs onto fewer hosts — First Fit Decreasing on combined utilization |
+| `spread` | Balance load evenly across hosts - greedy combined-score simulation picks the best single move per round |
+| `pack` | Consolidate VMs onto fewer hosts - First Fit Decreasing on combined utilization |
 
 All policies in one file must share a mode. Migrations never cross
 aggregate boundaries.
@@ -245,40 +245,42 @@ aggregate boundaries.
 One engine owns a set of aggregates (or the unassigned-hosts pool) and
 evaluates all enabled policies against each aggregate every cycle:
 
-1. **Score** — each policy runs its PromQL imbalance query; values must be in [0, 1]
-2. **Profile** — collect per-VM resource weights *across all policies* in one pass
-3. **Constrain** — reject any move that would break a Nova server-group placement rule
-4. **Enforce** (optional) — when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
+1. **Score** - each policy runs its PromQL imbalance query; values must be in [0, 1]
+2. **Profile** - collect per-VM resource weights *across all policies* in one pass
+3. **Constrain** - reject any move that would break a Nova server-group placement rule
+4. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
    propose repair moves for VMs already violating their groups
-5. **Plan** — simulate moves minimizing the weighted combined imbalance, sharing the
+5. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
    per-cycle migration budget with the enforcer
-6. **Cast** — send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
+6. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
    task carries a `phase` field (`affinity`, `spread`, or `pack`) that surfaces in
    logs so operators can see why each migration was proposed
-7. **Cooldown** — record aggregate-level and instance-level cooldown on plan
+7. **Cooldown** - record aggregate-level and instance-level cooldown on plan
    emission; skip VMs already in cooldown or quarantine on the next cycle
-8. **Result listener** — subscribe to `kronos.results.<aggregate>`, quarantine
+8. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
    VMs on a definitive failure (PreFlightError, MigrationFailed,
-   MigrationTimeout) so the planner stops re-proposing them
+   MigrationTimeout) so the planner stops re-proposing them. Transient
+   NovaClientError failures are not quarantined; the normal instance
+   cooldown governs re-planning.
 
 ### Executor (migration runner)
 
 One executor per aggregate consumes tasks from RabbitMQ:
 
-1. **Schedule** — priority queue sorted by `not_before` timestamps, semaphore for concurrency
-2. **Pre-flight** — verify instance is ACTIVE, no pending task_state, still on source host
-3. **Migrate** — call Nova live-migrate API
-4. **Poll** — check migration status until terminal state or timeout
-5. **Post-flight** — confirm instance landed on destination host and is ACTIVE
-6. **Retry** — on failure, re-cast with exponential backoff (up to `max_retries`)
-7. **Report** — publish `MigrationResult` notification on `kronos.results.<aggregate>`
+1. **Schedule** - priority queue sorted by `not_before` timestamps, semaphore for concurrency
+2. **Pre-flight** - verify instance is ACTIVE, no pending task_state, still on source host
+3. **Migrate** - call Nova live-migrate API
+4. **Poll** - check migration status until terminal state or timeout
+5. **Post-flight** - confirm instance landed on destination host and is ACTIVE
+6. **Retry** - on failure, re-cast with exponential backoff (up to `max_retries`)
+7. **Report** - publish `MigrationResult` notification on `kronos.results.<aggregate>`
 
 ### Messaging topology
 
 | Topic | Primitive | Publisher | Consumer |
 |-------|-----------|-----------|----------|
 | `kronos.migrations.<aggregate>` | RPC cast | Engine | Executor (competing consumers) |
-| `kronos.results.<aggregate>` | Notification | Executor | Engines (broadcast: active + passive update cooldown and quarantine state) |
+| `kronos.results.<aggregate>` | Notification | Executor | Engine (drives cooldown and quarantine state) |
 
 The unassigned-hosts pool uses the reserved name `_unassigned_` in its topics.
 
@@ -337,18 +339,13 @@ enforcer, planner) so you can see where cycles are spent.
 | **M1** | Project skeleton, oslo.config, clients, dry-run engine loop | Done |
 | **M2** | VM profiling, simulation-based migration planning, constraint checking, record/replay | Done |
 | **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
-| **M3.5** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
-| **M4** | HA via tooz distributed locks, active-passive engines and executors, distributed rate limiting | Planned |
-| **M5** | Audit logging (append-only JSONL) and general logging cleanup | Planned |
-| **M6** | PyPI packaging, container image, systemd units, documentation | Planned |
-
-Independent named milestones (any order):
-
-| Name | Scope |
-|------|-------|
-| Pack-rework | Pack mode redesign + compactor parity (`post_drain_action`, `ha_reserve`, host re-enable) |
-| Executor-multi-aggregate | One executor process can service multiple aggregates (one thread per topic) |
+| **M4** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
+| **M5** | Pre-migration live-migratability validation: local/ephemeral storage on source, CPU feature/mask compatibility between source and dest, host liveness | Planned |
+| **M6** | AZ awareness: discover Nova availability zones, surface them in logs and cycle reports, optionally restrict migrations to within an AZ (configurable, cross-AZ allowed by default) | Planned |
+| **M7** | Audit logging (append-only JSONL) and general logging cleanup: no leading whitespace, no multiline LOG calls, single format string per call (OpenStack-standard oslo.log style) | Planned |
+| **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Planned |
+| **M9** | PyPI packaging, container image, systemd units, documentation | Planned |
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 - see [LICENSE](LICENSE).

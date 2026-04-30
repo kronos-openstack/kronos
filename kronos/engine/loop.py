@@ -78,7 +78,7 @@ class EngineLoop:
         self._running = False
         self._cycle_count = 0
 
-        # Messaging — only initialised when dry_run=False.
+        # Messaging - only initialised when dry_run=False.
         # Keys: aggregate name, or None for the unassigned-hosts pool.
         self._rpc_clients: dict[str | None, oslo_messaging.RPCClient] = {}
         self._rpc_transport: oslo_messaging.Transport | None = None
@@ -271,7 +271,7 @@ class EngineLoop:
         ]
         result.policy_results = policy_results
 
-        # Combined imbalance signal — weighted sum across all non-skipped policies
+        # Combined imbalance signal - weighted sum across all non-skipped policies
         combined_imbalance = 0.0
         any_detected = False
         for policy, pr in zip(policies, policy_results, strict=True):
@@ -355,7 +355,7 @@ class EngineLoop:
         if plan.steps:
             if not dry_run:
                 self._emit_plan(plan, aggregate)
-            # Record cooldown unconditionally — keeping dry-run's rhythm
+            # Record cooldown unconditionally - keeping dry-run's rhythm
             # aligned with production means the simulated log shows
             # exactly the skipped cycles an operator would see live.
             self._cooldown.record_plan_emission(

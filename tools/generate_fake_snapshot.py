@@ -2,7 +2,7 @@
 
 The output directory has the exact layout produced by ``kronos-record``
 (see :mod:`kronos.cmd.record`), so the existing ``kronos-replay`` path
-consumes it unchanged — benchmark hits the real scorer, profiler,
+consumes it unchanged - benchmark hits the real scorer, profiler,
 constraints, planner, and enforcer, no mocks.
 
 All distributions are independent Gaussians clipped to sensible
@@ -63,8 +63,8 @@ def generate(
 ) -> None:
     """Write a synthetic snapshot to ``out_dir``.
 
-    The snapshot ships two synthetic policies — ``cpu-spread`` and
-    ``memory-spread`` — matching the shape of the sample
+    The snapshot ships two synthetic policies - ``cpu-spread`` and
+    ``memory-spread`` - matching the shape of the sample
     ``policies.yaml`` in ``internal-documentation/``.  Benchmark
     against that file.
     """
@@ -113,7 +113,7 @@ def generate(
     )
 
     # Place VMs on hosts roughly evenly.  Order matters for server-group
-    # placement decisions below — keep a flat vm->host assignment.
+    # placement decisions below - keep a flat vm->host assignment.
     vms_per_host_target = vms // hosts if hosts else 0
     leftover = vms - vms_per_host_target * hosts
 
@@ -217,7 +217,7 @@ def generate(
         for h in host_names
     }
 
-    # Query strings are opaque tokens — the Replay client looks them up
+    # Query strings are opaque tokens - the Replay client looks them up
     # by exact string match.  We emit distinctive sentinels so the
     # generated policies.yaml can reference them verbatim.
     cpu_imbalance_q = "FAKE:cpu-imbalance"
@@ -264,7 +264,7 @@ def generate(
 
     # --- Matching policies YAML --------------------------------------
     # Written into the snapshot so replays need no external policies
-    # file — point kronos.conf's policies_file at this path.
+    # file - point kronos.conf's policies_file at this path.
     (out_dir / "policies.yaml").write_text(
         _render_policies_yaml(
             cpu_imbalance_q=cpu_imbalance_q,

@@ -7,7 +7,7 @@ group rules.
 
 The enforcer is rule-driven: it decides *which* VMs must move.  The
 destination for each mandatory move is chosen by the same combined
-imbalance math the planner uses — so a repair never worsens a policy
+imbalance math the planner uses - so a repair never worsens a policy
 past its threshold.  Destinations that would break another server
 group policy for the same VM are rejected by the shared
 :class:`~kronos.engine.constraints.ConstraintChecker`.
@@ -100,7 +100,7 @@ class AffinityEnforcer:
 
         :returns: ``(plan, scores, vms_by_host, remaining_budget)``.
             ``scores`` and ``vms_by_host`` reflect the simulated state
-            after all repair steps have been applied — the imbalance
+            after all repair steps have been applied - the imbalance
             planner should start from them.  ``remaining_budget`` is
             what's left of ``budget`` after repairs.
         """
@@ -147,7 +147,7 @@ class AffinityEnforcer:
                 vm_profiles,
             )
             if step is None:
-                # No legal destination for any current violation — log
+                # No legal destination for any current violation - log
                 # and stop; imbalance planner still gets the remaining
                 # budget.
                 LOG.warning(

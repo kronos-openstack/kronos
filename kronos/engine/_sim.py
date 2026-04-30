@@ -193,7 +193,7 @@ def _simulated_extremes(
     """Return ``(max, min)`` after a simulated move, without mutation.
 
     Fast path (O(1)) when neither endpoint of the move is the current
-    extreme.  Slow path (O(H)) when it is — the previous extreme may
+    extreme.  Slow path (O(H)) when it is - the previous extreme may
     have shifted and the runner-up needs a scan.
     """
     if from_host == ex.max_host:

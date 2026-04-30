@@ -1,7 +1,7 @@
 """Migration execution: pre-flight, Nova live-migrate, poll, post-flight.
 
 The runner handles a single migration task from start to finish.
-It never decides *what* to migrate — the engine's planner does that.
+It never decides *what* to migrate - the engine's planner does that.
 The runner only validates and executes.
 """
 
@@ -29,10 +29,10 @@ class MigrationRunner:
     """Executes a single live migration against the Nova API.
 
     Lifecycle:
-      1. Pre-flight check — instance is ACTIVE, idle, still on from_host
+      1. Pre-flight check - instance is ACTIVE, idle, still on from_host
       2. Call Nova live-migrate
       3. Poll migration status until terminal or timeout
-      4. Post-flight verify — instance is on to_host and ACTIVE
+      4. Post-flight verify - instance is on to_host and ACTIVE
     """
 
     def __init__(self, conf: cfg.ConfigOpts, nova: NovaClient) -> None:
@@ -130,7 +130,7 @@ class MigrationRunner:
             status = self._nova.get_migration_status(task.instance_uuid)
 
             if status is None:
-                # No active migration — it either completed and disappeared,
+                # No active migration - it either completed and disappeared,
                 # or was never started. Check post-flight to determine.
                 return
 

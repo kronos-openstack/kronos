@@ -39,7 +39,7 @@ class MigrationRPCEndpoint:
 
     Exposes a single method, ``execute_migration``, invoked by the engine
     via ``RPCClient.cast()``.  The handler returns immediately after
-    queuing the task with the scheduler — oslo.messaging acks the message.
+    queuing the task with the scheduler - oslo.messaging acks the message.
     """
 
     target = oslo_messaging.Target(version="1.0")
@@ -134,7 +134,7 @@ class ExecutorWorker:
             "Executor ready; RPC topic '%s'",
             migrations_topic(self._aggregate),
         )
-        # Block here — oslo.messaging RPC server consumes in background threads
+        # Block here - oslo.messaging RPC server consumes in background threads
         self._stop_event.wait()
 
     def stop(self) -> None:

@@ -168,7 +168,7 @@ class TestSeed:
     def test_seed_aggregate_cooldown_clamped_to_configured(self) -> None:
         tracker = _tracker(aggregate_cd=600.0)
         tracker.seed_aggregate_cooldown("gpu", 9999.0)
-        # Still cooling, but the oldest possible — effective remaining
+        # Still cooling, but the oldest possible - effective remaining
         # is configured.
         assert tracker.is_aggregate_cooling("gpu")
         elapsed = time.monotonic() - tracker._aggregate_emissions["gpu"]

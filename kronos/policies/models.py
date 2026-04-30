@@ -10,7 +10,7 @@ aggregate's imbalance score.  This requires:
 * All policies share the same ``mode`` (spread and pack are opposite
   intents and cannot be combined).
 * Enabled policy ``weight`` values sum to 1.0.
-* Each ``imbalance_query`` returns values in [0, 1] — enforced at runtime
+* Each ``imbalance_query`` returns values in [0, 1] - enforced at runtime
   by the scorer.
 """
 

@@ -348,7 +348,7 @@ class NovaClient:
         """Get the status of any in-progress migration for an instance.
 
         Uses the server migrations API (``GET /servers/{id}/migrations``)
-        which only returns **active** migrations — not historical ones.
+        which only returns **active** migrations - not historical ones.
         Once a migration completes it disappears from this endpoint.
 
         :param instance_uuid: The instance UUID.

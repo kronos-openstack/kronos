@@ -74,7 +74,7 @@ class TestAntiAffinity:
     def test_soft_anti_affinity_blocks_move(
         self, checker: ConstraintChecker, mock_nova: MagicMock,
     ) -> None:
-        """Soft anti-affinity groups are also blocked — we respect the hint."""
+        """Soft anti-affinity groups are also blocked - we respect the hint."""
         mock_nova.list_server_groups.return_value = [
             {
                 "id": "g1",
@@ -149,7 +149,7 @@ class TestAffinity:
     def test_affinity_allows_move_when_other_members_not_placed(
         self, checker: ConstraintChecker, mock_nova: MagicMock,
     ) -> None:
-        """Members outside the current aggregate are ignored — Kronos only
+        """Members outside the current aggregate are ignored - Kronos only
         reasons about VMs visible in ``vms_by_host``.
         """
         mock_nova.list_server_groups.return_value = [

@@ -152,7 +152,7 @@ class TestExecuteFailure:
         ]
         nova.get_instance_host.side_effect = [
             "host-a",  # pre-flight
-            "host-a",  # post-flight — still on source!
+            "host-a",  # post-flight - still on source!
         ]
         nova.get_migration_status.return_value = None
 
@@ -169,7 +169,7 @@ class TestExecuteFailure:
         ]
         nova.get_instance_host.side_effect = [
             "host-a",  # pre-flight
-            "host-b",  # post-flight — right host but wrong status
+            "host-b",  # post-flight - right host but wrong status
         ]
         nova.get_migration_status.return_value = None
 

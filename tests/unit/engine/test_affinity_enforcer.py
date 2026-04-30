@@ -74,7 +74,7 @@ class TestDetectViolations:
             policy="anti-affinity",
             members=frozenset({"a", "b"}),
         )
-        # Only 'a' is visible; 'b' is outside the aggregate — not a violation.
+        # Only 'a' is visible; 'b' is outside the aggregate - not a violation.
         violations = _detect_violations(
             [group], {"h1": [_vm("a", "h1")]},
         )
@@ -99,7 +99,7 @@ class TestDetectViolations:
             policy="anti-affinity",
             members=frozenset({"a", "b"}),
         )
-        # Spread across h1 and h2 — compliant.
+        # Spread across h1 and h2 - compliant.
         violations = _detect_violations(
             [group],
             {"h1": [_vm("a", "h1")], "h2": [_vm("b", "h2")]},

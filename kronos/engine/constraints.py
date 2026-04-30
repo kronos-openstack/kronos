@@ -12,7 +12,7 @@ as move-blocking:
 See https://docs.openstack.org/nova/latest/user/server-groups.html
 
 Soft policies are currently treated with the same strictness as hard
-ones — we will not knowingly break a soft rule during migration.  A
+ones - we will not knowingly break a soft rule during migration.  A
 future change will plug soft rules into the planner as a weighted
 penalty rather than a hard veto.
 
@@ -48,7 +48,7 @@ class ServerGroup:
 class ConstraintChecker:
     """Checks whether a proposed migration is safe.
 
-    Current checks (all strict — even soft policies veto moves):
+    Current checks (all strict - even soft policies veto moves):
       - ``anti-affinity`` / ``soft-anti-affinity``: the destination host
         must not already hold another member of the group.
       - ``affinity`` / ``soft-affinity``: all other placed members of
@@ -138,7 +138,7 @@ class ConstraintChecker:
 
         A move is allowed when every other *currently placed* member of
         the group is already on ``dest_host``.  Members not visible in
-        ``vms_by_host`` are ignored — Kronos only reasons about VMs in
+        ``vms_by_host`` are ignored - Kronos only reasons about VMs in
         the aggregate under evaluation.
         """
         other_members = group.members - {vm.instance_uuid}

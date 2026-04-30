@@ -3,7 +3,7 @@
 Two message flows:
 
 - **Engine → Executor**: RPC cast (exactly-one delivery, competing consumers
-  semantics). Work queue — we want one executor to pick up each migration
+  semantics). Work queue - we want one executor to pick up each migration
   task, not broadcast.
 - **Executor → Engine(s)**: Notifications (broadcast, multiple listeners).
   Both active and passive engines subscribe to keep cooldown state warm.
@@ -78,7 +78,7 @@ def get_rpc_client(
     """Create an RPC client that casts migration tasks to an aggregate topic.
 
     Pass ``None`` for the unassigned-hosts pool.  Uses ``cast()`` for
-    fire-and-forget delivery — the engine never waits for a response.
+    fire-and-forget delivery - the engine never waits for a response.
     Exactly-one delivery via competing consumers.
     """
     target = oslo_messaging.Target(

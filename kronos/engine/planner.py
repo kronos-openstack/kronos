@@ -238,7 +238,7 @@ class Planner:
         Host ordering uses the combined weighted score.  A candidate
         destination must not breach any policy's ``capacity_threshold``.
         """
-        # Snapshot of original residents — only original VMs are drained.
+        # Snapshot of original residents - only original VMs are drained.
         original_vms_by_host: dict[str, list[VmProfile]] = {
             host: list(vms) for host, vms in vms_by_host.items()
         }

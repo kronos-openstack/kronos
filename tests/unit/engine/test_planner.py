@@ -246,7 +246,7 @@ class TestCombinedScoring:
             _policy_result("mem", mem_scores),
         ]
 
-        # Only one VM — a heavy-cpu + heavy-mem one on h1. Moving it
+        # Only one VM - a heavy-cpu + heavy-mem one on h1. Moving it
         # drops mem imbalance but inverts cpu imbalance to 0.25 > 0.15.
         profiles = {
             "v1": _vm("v1", "h1", {"cpu": 0.20, "mem": 0.50}),
@@ -264,8 +264,8 @@ class TestCombinedScoring:
         cpu = _make_policy(name="cpu", weight=0.5, threshold=0.50)
         mem = _make_policy(name="mem", weight=0.5, threshold=0.20)
 
-        cpu_scores = {"h1": 0.40, "h2": 0.10}        # 0.30 — above threshold
-        mem_scores = {"h1": 0.50, "h2": 0.10}        # 0.40 — above threshold
+        cpu_scores = {"h1": 0.40, "h2": 0.10}        # 0.30 - above threshold
+        mem_scores = {"h1": 0.50, "h2": 0.10}        # 0.40 - above threshold
 
         results = [
             _policy_result("cpu", cpu_scores),

@@ -109,7 +109,7 @@ engine_opts = [
         default=True,
         help=(
             "Also manage compute hosts that belong to no Nova host aggregate. "
-            "In Nova, aggregate membership is optional — hosts outside any "
+            "In Nova, aggregate membership is optional - hosts outside any "
             "aggregate form an ungrouped pool. With this enabled, the engine "
             "treats that pool as an independent planning scope: migrations "
             "stay within the pool and never cross into a named aggregate."
@@ -209,7 +209,7 @@ def register_opts(conf: cfg.ConfigOpts) -> None:
     conf.register_opts(engine_opts, group=ENGINE_GROUP)
     conf.register_opts(prometheus_opts, group=PROMETHEUS_GROUP)
 
-    # Nova auth via keystoneauth1 — registers auth_type, auth_url,
+    # Nova auth via keystoneauth1 - registers auth_type, auth_url,
     # username, password, project_name, user_domain_name, etc.
     ks_loading.register_auth_conf_options(conf, NOVA_GROUP)
     ks_loading.register_session_conf_options(conf, NOVA_GROUP)

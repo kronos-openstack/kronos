@@ -72,7 +72,7 @@ class PolicyScorer:
                 "No matching host data from Prometheus.",
             )
 
-        # Enforce the [0, 1] contract — the policy's imbalance_query must
+        # Enforce the [0, 1] contract - the policy's imbalance_query must
         # return utilization ratios, not absolute values.
         out_of_range = {
             h: v for h, v in filtered.items() if v < 0.0 or v > 1.0

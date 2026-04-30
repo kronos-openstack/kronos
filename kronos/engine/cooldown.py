@@ -4,7 +4,7 @@ Prevents oscillation and migration storms.  Two levels:
 
 - **Aggregate-level**: after emitting a plan for aggregate X, skip
   planning for the same aggregate until ``engine.cooldown`` expires.
-  Global across all policies — combined scoring emits one plan per
+  Global across all policies - combined scoring emits one plan per
   aggregate per cycle.
 - **Instance-level**: after including a VM in a plan, skip it for
   ``engine.instance_cooldown`` seconds.  Prevents a VM bouncing
