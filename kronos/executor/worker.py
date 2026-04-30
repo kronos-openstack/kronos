@@ -123,7 +123,14 @@ class ExecutorWorker:
         self._stop_event = threading.Event()
 
     def start(self) -> None:
-        """Start the executor. Blocks until stop() is called."""
+        """Start the executor. Blocks until stop is requested.
+
+        Cleanup runs from this method (the main thread) once the stop
+        event fires, not from the signal handler.  oslo.messaging
+        ``stop()``/``wait()`` take locks that aren't safe to acquire
+        from a signal-handler context, and a re-entrant signal during
+        cleanup can deadlock.
+        """
         LOG.info(
             "Starting executor for aggregate '%s'",
             self._aggregate_label,
@@ -136,14 +143,56 @@ class ExecutorWorker:
         )
         # Block here - oslo.messaging RPC server consumes in background threads
         self._stop_event.wait()
+        self._shutdown()
+
+    def request_stop(self) -> None:
+        """Async-signal-safe stop request.  Call from signal handlers."""
+        self._stop_event.set()
 
     def stop(self) -> None:
-        """Stop the executor gracefully."""
-        LOG.info("Stopping executor for aggregate '%s'", self._aggregate_label)
-        self._rpc_server.stop()
-        self._rpc_server.wait()  # drain in-flight RPC calls
-        self._scheduler.stop()
+        """Synchronous stop: nudge the event and run cleanup inline.
+
+        Suitable for tests and any caller already on the main thread.
+        Signal handlers should call :meth:`request_stop` instead so
+        that cleanup runs from the daemon's main thread.
+        """
         self._stop_event.set()
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Drain RPC + scheduler with a hard-exit watchdog.
+
+        ``MessageHandlingServer.wait()`` has no timeout in
+        oslo.messaging; if a consumer thread doesn't unwind we run the
+        drain in a daemon thread and give up after a deadline so the
+        process actually exits.  The scheduler's worker threads are
+        daemon, so anything still in-flight at deadline dies with the
+        process - migrations Nova has already started continue on
+        Nova's side regardless.
+        """
+        LOG.info("Stopping executor for aggregate '%s'", self._aggregate_label)
+
+        def _drain() -> None:
+            try:
+                self._rpc_server.stop()
+                self._rpc_server.wait()  # drain in-flight RPC handlers
+            except Exception as exc:
+                LOG.warning("Error stopping RPC server: %s", exc)
+            try:
+                self._scheduler.stop()
+            except Exception as exc:
+                LOG.warning("Error stopping scheduler: %s", exc)
+
+        drainer = threading.Thread(
+            target=_drain, name="executor-shutdown", daemon=True,
+        )
+        drainer.start()
+        drainer.join(timeout=15.0)
+        if drainer.is_alive():
+            LOG.warning(
+                "Executor shutdown did not complete within 15s; "
+                "exiting anyway.",
+            )
 
     def _execute_with_retry(self, task: MigrationTask) -> MigrationResult:
         """Execute a task, re-casting to RPC on failure if retries remain."""

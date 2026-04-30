@@ -75,9 +75,13 @@ def main() -> int:
     worker = ExecutorWorker(CONF, aggregate)
 
     def handle_signal(signum: int, frame: FrameType | None) -> None:
+        # Signal handlers must do only async-signal-safe work.  Just
+        # nudge the worker; the main thread runs the actual shutdown
+        # (oslo.messaging takes locks that aren't safe to acquire here,
+        # and a re-entrant signal during stop() can deadlock).
         sig_name = signal.Signals(signum).name
         LOG.info("Received %s, shutting down...", sig_name)
-        worker.stop()
+        worker.request_stop()
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)

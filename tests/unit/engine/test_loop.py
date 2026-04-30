@@ -440,10 +440,36 @@ class TestStartLoop:
         with patch("kronos.engine.loop.load_policies", return_value=policies):
             mock_engine._scorer.evaluate.return_value = _make_policy_result()
 
-            def stop_after_sleep(interval: int) -> None:
+            def stop_after_wait(*_a: object, **_kw: object) -> bool:
                 mock_engine._running = False
+                return True
 
-            with patch("kronos.engine.loop.time.sleep", side_effect=stop_after_sleep):
+            # Inter-cycle pause is now an Event.wait, not time.sleep.
+            with patch.object(
+                mock_engine._wakeup, "wait", side_effect=stop_after_wait,
+            ):
                 mock_engine.start()
 
+        assert mock_engine._cycle_count == 1
+
+    def test_signal_unblocks_intercycle_wait(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        """Signal handler must unblock the inter-cycle wait immediately."""
+        import signal as _signal
+        policies = _make_policies_config(_make_policy())
+
+        with patch("kronos.engine.loop.load_policies", return_value=policies):
+            mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+            def fire_signal(*_a: object, **_kw: object) -> bool:
+                mock_engine._handle_signal(_signal.SIGTERM, None)
+                return True
+
+            with patch.object(
+                mock_engine._wakeup, "wait", side_effect=fire_signal,
+            ):
+                mock_engine.start()
+
+        assert mock_engine._running is False
         assert mock_engine._cycle_count == 1

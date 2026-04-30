@@ -14,6 +14,7 @@ aggregate is evaluated independently every cycle:
 from __future__ import annotations
 
 import signal
+import threading
 import time
 import uuid
 from datetime import UTC, datetime
@@ -84,6 +85,13 @@ class EngineLoop:
         self._running = False
         self._cycle_count = 0
 
+        # Wakeup event used as the inter-cycle sleep.  CPython retries
+        # `time.sleep()` on EINTR (PEP 475), so a SIGTERM during the
+        # sleep would otherwise have to wait the full interval before
+        # the loop notices.  Setting this from the signal handler
+        # unblocks the wait immediately.
+        self._wakeup = threading.Event()
+
         # Messaging - only initialised when dry_run=False.
         # Keys: aggregate name, or None for the unassigned-hosts pool.
         self._rpc_clients: dict[str | None, oslo_messaging.RPCClient] = {}
@@ -126,7 +134,11 @@ class EngineLoop:
             self._log_report(report)
 
             if self._running:
-                time.sleep(interval)
+                # Interruptible inter-cycle sleep.  The signal handler
+                # sets `_wakeup` so SIGTERM/SIGINT exits within
+                # milliseconds instead of waiting the full interval.
+                self._wakeup.wait(timeout=interval)
+                self._wakeup.clear()
 
         self._shutdown_messaging()
         LOG.info("Engine loop stopped after %d cycles.", self._cycle_count)
@@ -134,16 +146,42 @@ class EngineLoop:
     def stop(self) -> None:
         """Signal the loop to stop after the current cycle."""
         self._running = False
+        self._wakeup.set()
 
     def _shutdown_messaging(self) -> None:
-        """Stop and drain the result listeners."""
-        for listener in self._result_listeners:
-            try:
-                listener.stop()
-                listener.wait()
-            except Exception as exc:
-                LOG.warning("Error while stopping result listener: %s", exc)
+        """Stop and drain the result listeners.
+
+        ``MessageHandlingServer.wait()`` has no timeout in oslo.messaging;
+        if a transport thread doesn't unwind we drain in a daemon
+        thread and continue after a deadline rather than blocking the
+        process forever.
+        """
+        if not self._result_listeners:
+            return
+
+        listeners = list(self._result_listeners)
         self._result_listeners.clear()
+
+        def _drain() -> None:
+            for listener in listeners:
+                try:
+                    listener.stop()
+                    listener.wait()
+                except Exception as exc:
+                    LOG.warning(
+                        "Error while stopping result listener: %s", exc,
+                    )
+
+        drainer = threading.Thread(
+            target=_drain, name="engine-shutdown", daemon=True,
+        )
+        drainer.start()
+        drainer.join(timeout=10.0)
+        if drainer.is_alive():
+            LOG.warning(
+                "Result listeners did not drain within 10s; "
+                "exiting anyway.",
+            )
 
     def _drop_vms_on_unreachable_hosts(
         self,
@@ -602,6 +640,14 @@ class EngineLoop:
             )
 
     def _handle_signal(self, signum: int, frame: FrameType | None) -> None:
+        """Signal handler: flip the flag and unblock the inter-cycle wait.
+
+        Signal handlers run in the main thread between bytecodes; do
+        only async-signal-safe work here.  The actual shutdown
+        (messaging drain, listener join) runs from `start()` once the
+        loop sees `_running == False`.
+        """
         sig_name = signal.Signals(signum).name
         LOG.info("Received %s, shutting down gracefully...", sig_name)
         self._running = False
+        self._wakeup.set()
