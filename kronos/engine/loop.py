@@ -23,7 +23,7 @@ import oslo_messaging
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from kronos.clients.nova import NovaClient
+from kronos.clients.nova import ComputeService, NovaClient
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.messaging import (
     get_notification_listener,
@@ -34,9 +34,11 @@ from kronos.common.messaging import (
     results_topic,
     task_to_dict,
 )
+from kronos.engine._sim import combined_imbalance, group_vms_by_host
 from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
+from kronos.engine.evacuator import Evacuator
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.result_listener import MigrationResultEndpoint
@@ -70,6 +72,10 @@ class EngineLoop:
             self._constraints,
             enforce_hard=conf.engine.enforce_hard_affinity,
             enforce_soft=conf.engine.enforce_soft_affinity,
+        )
+        self._evacuator = Evacuator(
+            self._constraints,
+            enabled=conf.engine.evacuate_disabled_hosts,
         )
         self._cooldown = CooldownTracker(
             aggregate_cooldown_seconds=float(conf.engine.cooldown),
@@ -138,6 +144,51 @@ class EngineLoop:
             except Exception as exc:
                 LOG.warning("Error while stopping result listener: %s", exc)
         self._result_listeners.clear()
+
+    def _drop_vms_on_unreachable_hosts(
+        self,
+        vm_profiles: dict[str, VmProfile],
+        aggregate_hosts: list[str],
+        services: dict[str, ComputeService],
+        aggregate_name: str,
+    ) -> dict[str, VmProfile]:
+        """Drop VMs whose source host's nova-compute service is down.
+
+        Live migration can't move a VM off a hypervisor whose
+        nova-compute service is offline (``state=down``) or whose
+        service is missing entirely from the cluster's view.  These
+        VMs need cold migration / evacuate, which Kronos does not
+        perform.  Excluding them from the candidate set stops the
+        planner from generating doomed-to-fail tasks.
+
+        Hosts whose service is ``status=disabled`` but ``state=up`` are
+        *not* dropped here - the evacuator may still want to drain them
+        when ``[engine] evacuate_disabled_hosts`` is set.
+        """
+        scope = set(aggregate_hosts)
+        kept: dict[str, VmProfile] = {}
+        dropped: list[str] = []
+        for instance_uuid, profile in vm_profiles.items():
+            if profile.host not in scope:
+                # Not in this aggregate - shouldn't happen, but be
+                # defensive about the profile/hosts mismatch.
+                kept[instance_uuid] = profile
+                continue
+            svc = services.get(profile.host)
+            if svc is None or not svc.is_up:
+                dropped.append(instance_uuid)
+                continue
+            kept[instance_uuid] = profile
+
+        if dropped:
+            LOG.info(
+                "Aggregate '%s': dropped %d VM(s) on hosts whose "
+                "nova-compute service is down/missing: %s",
+                aggregate_name,
+                len(dropped),
+                dropped,
+            )
+        return kept
 
     def _filter_unavailable_vms(
         self,
@@ -225,6 +276,13 @@ class EngineLoop:
 
         self._constraints.invalidate_cache()
 
+        # One per-cycle nova-compute service map shared by the
+        # constraint checker (gates destinations) and the evacuator
+        # (selects disabled-host candidates).  Cluster-wide; each
+        # aggregate intersects with its own host list.
+        services = self._fetch_services()
+        self._constraints.set_services(services)
+
         report = CycleReport(
             cycle_number=self._cycle_count,
             started_at=started_at,
@@ -237,7 +295,7 @@ class EngineLoop:
         for aggregate in aggregates:
             try:
                 result = self._evaluate_aggregate(
-                    aggregate, enabled_policies, dry_run,
+                    aggregate, enabled_policies, dry_run, services,
                 )
                 report.aggregate_results.append(result)
             except Exception as exc:
@@ -249,11 +307,31 @@ class EngineLoop:
         report.completed_at = datetime.now(tz=UTC)
         return report
 
+    def _fetch_services(self) -> dict[str, ComputeService]:
+        """Fetch nova-compute services once per cycle.
+
+        On Nova API failure we log and fall back to an empty map, which
+        the constraint checker treats as "no host is available" - the
+        engine effectively pauses migrations for the cycle.  That is
+        the right behaviour: we don't know who is up.
+        """
+        try:
+            services = self._nova.list_compute_services()
+        except Exception:
+            LOG.warning(
+                "Failed to fetch nova-compute services; planning paused "
+                "this cycle (no destinations considered available).",
+                exc_info=True,
+            )
+            return {}
+        return {svc.host: svc for svc in services}
+
     def _evaluate_aggregate(
         self,
         aggregate: str | None,
         policies: list[PolicyConfig],
         dry_run: bool,
+        services: dict[str, ComputeService],
     ) -> AggregateResult:
         """Run all policies against one aggregate and plan migrations."""
         name = aggregate if aggregate is not None else "<unassigned>"
@@ -272,21 +350,25 @@ class EngineLoop:
         result.policy_results = policy_results
 
         # Combined imbalance signal - weighted sum across all non-skipped policies
-        combined_imbalance = 0.0
+        weighted_imbalance = 0.0
         any_detected = False
         for policy, pr in zip(policies, policy_results, strict=True):
             if pr.skipped:
                 continue
-            combined_imbalance += policy.weight * pr.imbalance
+            weighted_imbalance += policy.weight * pr.imbalance
             if pr.imbalance_detected:
                 any_detected = True
-        result.combined_imbalance = combined_imbalance
+        result.combined_imbalance = weighted_imbalance
         result.imbalance_detected = any_detected
 
-        # Profiling + planning run whenever imbalance is detected OR the
-        # affinity enforcer is enabled (violations can exist even with
-        # no imbalance signal).
-        if not any_detected and not self._enforcer.enabled:
+        # Profiling + planning run whenever imbalance is detected, the
+        # affinity enforcer is enabled, or the evacuator is enabled
+        # (any of them can produce moves even without imbalance signal).
+        if (
+            not any_detected
+            and not self._enforcer.enabled
+            and not self._evacuator.enabled
+        ):
             return result
 
         # Cooldown check applies to any migration emission.  Enforced
@@ -318,6 +400,9 @@ class EngineLoop:
             hosts=hosts,
             host_scores_by_policy=host_scores_by_policy,
         )
+        vm_profiles = self._drop_vms_on_unreachable_hosts(
+            vm_profiles, hosts, services, name,
+        )
         vm_profiles = self._filter_unavailable_vms(vm_profiles, name)
         result.vm_profiles = vm_profiles
 
@@ -326,19 +411,49 @@ class EngineLoop:
 
         budget = max(p.max_migrations_per_cycle for p in active_policies)
 
+        scores = {
+            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
+            for p, pr in zip(active_policies, active_results, strict=True)
+        }
+        vms_by_host = group_vms_by_host(vm_profiles)
+
+        plan = MigrationPlan(
+            aggregate=name,
+            policy_names=[p.name for p in active_policies],
+            initial_imbalance=combined_imbalance(scores, active_policies),
+        )
+
+        # --- Evacuation pass (drain admin-disabled hosts) ---
+        # Runs first so the affinity enforcer and the imbalance planner
+        # see the post-evacuation simulated state.
+        evac_plan, scores, vms_by_host, remaining = self._evacuator.evacuate(
+            aggregate=name,
+            aggregate_hosts=hosts,
+            policies=active_policies,
+            scores=scores,
+            vms_by_host=vms_by_host,
+            vm_profiles=vm_profiles,
+            services=services,
+            budget=budget,
+        )
+        plan.steps.extend(evac_plan.steps)
+
         # --- Affinity enforcement pass (repair existing violations) ---
-        plan, scores, vms_by_host, remaining = self._enforcer.enforce(
+        enforce_plan, scores, vms_by_host, remaining = self._enforcer.enforce(
             aggregate=name,
             policies=active_policies,
             policy_results=active_results,
             vm_profiles=vm_profiles,
-            budget=budget,
+            budget=remaining,
+            scores=scores,
+            vms_by_host=vms_by_host,
         )
+        plan.steps.extend(enforce_plan.steps)
 
         # --- Imbalance pass (reduce PromQL-driven imbalance) ---
         # Only runs if the scorer flagged imbalance and budget remains.
-        # The enforcer may have left some imbalance behind; that's fine,
-        # the planner tackles it within `remaining` moves.
+        # The earlier passes may have left some imbalance behind; the
+        # planner tackles it within ``remaining`` moves.
         if any_detected:
             plan = self._planner.plan(
                 aggregate=name,
@@ -350,6 +465,8 @@ class EngineLoop:
                 budget=remaining,
                 plan=plan,
             )
+
+        plan.projected_imbalance = combined_imbalance(scores, active_policies)
         result.migration_plan = plan
 
         if plan.steps:

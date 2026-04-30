@@ -195,6 +195,24 @@ def generate(
         json.dumps(instances, indent=2),
     )
 
+    # All hosts up + enabled.  Replays consult this for destination
+    # availability and evacuation candidates; the synthetic fixture
+    # mirrors a healthy cluster so the planner has freedom to move VMs.
+    services_payload = [
+        {
+            "host": h,
+            "binary": "nova-compute",
+            "state": "up",
+            "status": "enabled",
+            "disabled_reason": "",
+            "forced_down": False,
+        }
+        for h in host_names
+    ]
+    (nova_dir / "services.json").write_text(
+        json.dumps(services_payload, indent=2),
+    )
+
     # --- Prometheus ---------------------------------------------------
     prom_dir = out_dir / "prometheus"
     prom_dir.mkdir()

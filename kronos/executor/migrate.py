@@ -20,7 +20,7 @@ from kronos.common.exceptions import (
     NovaClientError,
     PreFlightError,
 )
-from kronos.engine.types import MigrationResult, MigrationTask
+from kronos.engine.types import MigrationPhase, MigrationResult, MigrationTask
 
 LOG = logging.getLogger(__name__)
 
@@ -97,7 +97,19 @@ class MigrationRunner:
             )
 
     def _pre_flight(self, task: MigrationTask) -> None:
-        """Validate the instance is in a migratable state."""
+        """Validate the instance and host are in a migratable state.
+
+        Re-checks nova-compute service state for both source and
+        destination right before live-migrate.  The engine already
+        filtered destinations at plan time, but service state can flip
+        between dispatch and execution (operator disables a host, a
+        node loses heartbeat); refusing here closes that gap.
+
+        The evacuation phase tolerates a ``status=disabled`` source -
+        that's the whole point of evacuation, the source is *meant* to
+        be drained.  All phases still require ``state=up`` on the
+        source (live migration cannot move a VM off a dead hypervisor).
+        """
         status, task_state = self._nova.get_instance_status(task.instance_uuid)
 
         if status != "ACTIVE":
@@ -119,6 +131,54 @@ class MigrationRunner:
                 reason=(
                     f"Instance is on {current_host}, "
                     f"expected {task.from_host}. It may have already moved."
+                ),
+            )
+
+        self._check_service_state(task)
+
+    def _check_service_state(self, task: MigrationTask) -> None:
+        """Refuse the move if source or destination service is unfit."""
+        services = {
+            svc.host: svc for svc in self._nova.list_compute_services()
+        }
+
+        source = services.get(task.from_host)
+        if source is None or not source.is_up:
+            raise PreFlightError(
+                instance_uuid=task.instance_uuid,
+                reason=(
+                    f"Source host '{task.from_host}' nova-compute service is "
+                    f"{'missing' if source is None else 'down'}; "
+                    "cannot live-migrate from a dead hypervisor."
+                ),
+            )
+
+        is_evacuation = task.phase == MigrationPhase.EVACUATE
+        if not is_evacuation and not source.is_enabled:
+            # Non-evacuation phase plans expect the source to still be
+            # in normal service.  A late-disabled source means an
+            # operator just took it out of rotation; the executor
+            # should not proceed - the engine can re-plan as an
+            # evacuation if `evacuate_disabled_hosts` is on.
+            raise PreFlightError(
+                instance_uuid=task.instance_uuid,
+                reason=(
+                    f"Source host '{task.from_host}' nova-compute service is "
+                    f"administratively disabled ({source.disabled_reason!r}); "
+                    "refusing non-evacuation migration."
+                ),
+            )
+
+        dest = services.get(task.to_host)
+        if dest is None or not dest.is_available_destination:
+            raise PreFlightError(
+                instance_uuid=task.instance_uuid,
+                reason=(
+                    f"Destination host '{task.to_host}' is not a valid "
+                    f"live-migration target "
+                    f"(state={dest.state if dest else 'missing'}, "
+                    f"status={dest.status if dest else 'missing'}, "
+                    f"forced_down={dest.forced_down if dest else 'n/a'})."
                 ),
             )
 

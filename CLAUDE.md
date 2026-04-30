@@ -23,11 +23,26 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
 - **Aggregate boundaries**: migrations stay within an aggregate. The
   unassigned pool is its own scope - migrations never cross between it
   and a named aggregate.
-- **AZ awareness** (planned, M6): the planner discovers each
+- **AZ awareness** (planned): the planner discovers each
   hypervisor's availability zone and surfaces it in logs and cycle
   reports. Cross-AZ migrations are allowed by default; an opt-in
   `[engine] restrict_to_az` flag makes the planner refuse moves
   whose source and destination AZs differ.
+- **Host liveness gate**: every cycle the engine fetches Nova
+  `os-services` once and installs the result on the constraint
+  checker. Only hosts whose `nova-compute` service is `state=up` and
+  `status=enabled` (and not `forced_down`) are accepted as
+  destinations. The constraint checker fails closed when service
+  state has not been installed - the engine always installs it
+  right after `invalidate_cache()`. The executor re-checks at
+  pre-flight to catch state changes between dispatch and execution.
+- **Evacuator**: when `[engine] evacuate_disabled_hosts = true`,
+  VMs on hosts whose service is `status=disabled` (but still up)
+  are evacuated. Runs *before* the affinity enforcer and the
+  imbalance planner; all three share `max_migrations_per_cycle` as
+  one budget. Hosts with `state=down` are not evacuated - live
+  migration cannot drain them. Storage is intentionally not
+  validated; Nova's `block_migration='auto'` decides per-VM.
 
 ## OpenStack Conventions - MUST FOLLOW
 - **oslo.config** for all daemon configuration (`kronos.conf`)
@@ -185,11 +200,18 @@ decisions. Retry logic lives in the client, not the caller.
 - Returns dataclasses (`ComputeHost`, `Instance`, `HostAggregate`, `MigrationStatus`), not raw openstacksdk objects
 - **Read**: `list_aggregates()`, `get_aggregate()`, `list_compute_hosts()`,
   `list_instances_on_host()`, `list_server_groups()`,
+  `list_compute_services()`,
   `get_hosts_in_aggregate(name | None)` - `None` returns hypervisors
   not in any aggregate (the unassigned pool). Only QEMU/KVM
   hypervisors are returned; ironic bare-metal nodes are filtered out.
 - **Write**: `live_migrate()`, `get_instance_status()`,
   `get_instance_host()`, `get_migration_status()`
+- **`list_compute_services()`**: returns `ComputeService` dataclasses
+  for every `nova-compute` entry in `os-services`. Each has `host`,
+  `binary`, `state` (`up`/`down`), `status` (`enabled`/`disabled`),
+  `disabled_reason`, `forced_down`. The helper
+  `is_available_destination` is True only when up + enabled and not
+  forced down. Other binaries (conductor/scheduler) are filtered out.
 - **Server group compatibility**: reads both legacy `policy` (singular
   string) and modern `policies` (list) and merges them. Older Nova
   deployments populate only the singular field.
@@ -227,6 +249,9 @@ calls Nova live-migrate directly.
 - `affinity_enforcer.py` - `AffinityEnforcer`: repair pass that moves VMs out of existing server-group violations using the same combined-imbalance math the planner uses
 - `cooldown.py` - `CooldownTracker`: aggregate-level cooldown, instance-level cooldown, post-failure quarantine
 - `result_listener.py` - `MigrationResultEndpoint`: oslo.messaging notification endpoint that consumes `migration.completed` / `migration.failed` events and drives quarantine
+- `evacuator.py` - `Evacuator`: drains VMs off `status=disabled`
+  nova-compute hosts. Runs before the affinity enforcer and the
+  planner; uses the same combined-imbalance + threshold math
 - `loop.py` - `EngineLoop`: periodic per-aggregate evaluation cycle, plan emission via RPC cast, result-listener lifecycle
 
 ### Scope resolution
@@ -370,6 +395,42 @@ Future: NUMA, CPU feature flags, flavor extra specs, soft-rule
 penalties in the planner -
 https://docs.openstack.org/nova/latest/user/server-groups.html
 
+### Host evacuation
+
+`Evacuator` drains VMs off compute hosts whose nova-compute service is
+administratively disabled.  Enabled per engine via:
+
+```ini
+[engine]
+evacuate_disabled_hosts = false   # default
+```
+
+**Algorithm**, per aggregate:
+
+1. Intersect the cluster-wide service map with the aggregate's host
+   list (so disabled hosts in unrelated aggregates / AZs are
+   ignored).
+2. Identify candidate VMs: every VM on a `status=disabled` *and*
+   `state=up` host in scope.  Hosts with `state=down` are not
+   evacuated - live migration cannot drain them.
+3. For each candidate, simulate every (vm, dest) pair and accept it
+   only when:
+   - `ConstraintChecker.check` passes (destination is up + enabled,
+     and no server-group rule is broken).
+   - The move does not push any policy past its threshold.
+4. Pick the pair that leaves combined imbalance lowest, apply it,
+   record a step with phase `evacuate`, and repeat.
+
+**Order**: evacuator → affinity enforcer → imbalance planner.  All
+three share one `max_migrations_per_cycle` budget; the evacuator
+consumes first.
+
+**Pre-flight (executor)**: every migration re-checks source +
+destination service state.  Refuses if either is no longer up +
+enabled, *except* evacuation tasks (`phase=evacuate`) tolerate a
+`status=disabled` source - that is precisely the condition that
+made the move legitimate.
+
 ### Affinity enforcement
 
 `AffinityEnforcer` runs **before** the imbalance planner and proactively
@@ -487,13 +548,20 @@ erroring.
 ### EngineLoop lifecycle
 1. Load oslo.config + policies YAML
 2. Resolve aggregate scope from `[engine] aggregates` and `include_unassigned_hosts`
-3. Initialise Prometheus client, Nova client, scorer, profiler, constraints, planner, cooldown
+3. Initialise Prometheus client, Nova client, scorer, profiler, constraints, evacuator, enforcer, planner, cooldown
 4. If `dry_run=false`: create RPC transport + per-aggregate RPC clients, and a
    notification transport + per-aggregate result listeners
-5. Enter loop: for each aggregate → score → cooldown check → profile →
-   filter unavailable VMs → plan → cast → log
+5. Enter loop. Each cycle:
+   - `invalidate_cache()` on the constraint checker.
+   - Fetch nova-compute services once cluster-wide; install on the
+     constraint checker (host-availability gate) and pass to the
+     evacuator.  On failure, install an empty map - the gate fails
+     closed and no migrations are emitted that cycle.
+   - For each aggregate → score → cooldown check → profile → drop
+     VMs whose source host is `state=down` → filter
+     quarantined/cooling VMs → evacuate disabled hosts → enforce
+     affinity → plan imbalance → cast → log.
 6. Handle SIGTERM/SIGINT for graceful shutdown (drains result listeners)
-7. Constraint cache invalidated each cycle
 
 ---
 

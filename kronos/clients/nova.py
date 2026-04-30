@@ -59,6 +59,37 @@ class HostAggregate:
     metadata: dict[str, str]
 
 
+@dataclass
+class ComputeService:
+    """Nova compute service entry from the ``os-services`` API.
+
+    ``state`` reflects the heartbeat freshness (``up`` or ``down``);
+    ``status`` reflects the administrative gate (``enabled`` or
+    ``disabled``).  A host is a valid live-migration destination only
+    when ``state == 'up'`` and ``status == 'enabled'``.
+    """
+
+    host: str
+    binary: str
+    state: str
+    status: str
+    disabled_reason: str = ""
+    forced_down: bool = False
+
+    @property
+    def is_up(self) -> bool:
+        return self.state == "up"
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.status == "enabled"
+
+    @property
+    def is_available_destination(self) -> bool:
+        """Eligible to receive a live migration."""
+        return self.is_up and self.is_enabled and not self.forced_down
+
+
 class MigrationStatus(enum.StrEnum):
     """Nova live migration status values."""
 
@@ -240,6 +271,41 @@ class NovaClient:
             )
 
         return instances
+
+    def list_compute_services(self) -> list[ComputeService]:
+        """List ``nova-compute`` service entries.
+
+        Used by the engine to filter destinations to hosts whose
+        compute service is up and administratively enabled, and by the
+        executor to re-check service state at pre-flight time.
+
+        :returns: List of ComputeService instances (one per nova-compute
+            host).  Other binaries (``nova-conductor`` etc.) are filtered
+            out.
+        :raises NovaClientError: If the API call fails.
+        """
+        try:
+            services = list(self._conn.compute.services())
+        except Exception as exc:
+            raise NovaClientError(
+                reason=f"Failed to list compute services: {exc}"
+            ) from exc
+
+        result: list[ComputeService] = []
+        for s in services:
+            if getattr(s, "binary", "") != "nova-compute":
+                continue
+            result.append(
+                ComputeService(
+                    host=getattr(s, "host", "") or "",
+                    binary=getattr(s, "binary", ""),
+                    state=str(getattr(s, "state", "") or "").lower(),
+                    status=str(getattr(s, "status", "") or "").lower(),
+                    disabled_reason=str(getattr(s, "disabled_reason", "") or ""),
+                    forced_down=bool(getattr(s, "forced_down", False)),
+                ),
+            )
+        return result
 
     def list_server_groups(self) -> list[dict[str, object]]:
         """List server groups across all projects.

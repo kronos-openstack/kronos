@@ -93,6 +93,22 @@ def _record_nova(
         LOG.error("Failed to list server groups", exc_info=True)
         (nova_dir / "server_groups.json").write_text("[]")
 
+    # Nova-compute service state per host.  The engine consults this
+    # every cycle to filter live-migration destinations and to find
+    # evacuation candidates.
+    try:
+        services = nova.list_compute_services()
+        (nova_dir / "services.json").write_text(
+            json.dumps(
+                [dataclasses.asdict(svc) for svc in services],
+                indent=2,
+            ),
+        )
+        LOG.info("Recorded %d nova-compute services", len(services))
+    except Exception:
+        LOG.error("Failed to list compute services", exc_info=True)
+        (nova_dir / "services.json").write_text("[]")
+
 
 def _record_prometheus(
     prometheus: PrometheusClient,

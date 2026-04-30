@@ -6,10 +6,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kronos.clients.nova import MigrationStatus
+from kronos.clients.nova import ComputeService, MigrationStatus
 from kronos.common.exceptions import NovaClientError
 from kronos.engine.types import MigrationPhase, MigrationTask
 from kronos.executor.migrate import MigrationRunner
+
+
+def _all_up_services(*hosts: str) -> list[ComputeService]:
+    return [
+        ComputeService(
+            host=h, binary="nova-compute", state="up", status="enabled",
+        )
+        for h in hosts
+    ]
 
 
 def _make_task(**overrides: object) -> MigrationTask:
@@ -35,6 +44,10 @@ def runner() -> tuple[MigrationRunner, MagicMock]:
     conf.executor.migration_timeout = 60
     conf.executor.migration_poll_interval = 1
     nova = MagicMock()
+    # Default: both source and destination are up + enabled.
+    nova.list_compute_services.return_value = _all_up_services(
+        "host-a", "host-b",
+    )
     r = MigrationRunner(conf, nova)
     return r, nova
 
@@ -187,3 +200,147 @@ class TestExecuteFailure:
         result = r.execute(_make_task())
 
         assert not result.success
+
+
+class TestPreFlightServiceState:
+    """Pre-flight re-checks nova-compute service state for src + dest."""
+
+    def test_destination_disabled_blocks(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.return_value = "host-a"
+        # Source up, destination disabled between dispatch and execution.
+        nova.list_compute_services.return_value = [
+            ComputeService(
+                host="host-a", binary="nova-compute",
+                state="up", status="enabled",
+            ),
+            ComputeService(
+                host="host-b", binary="nova-compute",
+                state="up", status="disabled",
+                disabled_reason="maintenance",
+            ),
+        ]
+
+        result = r.execute(_make_task())
+
+        assert not result.success
+        assert "host-b" in result.error
+        nova.live_migrate.assert_not_called()
+
+    def test_destination_down_blocks(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.return_value = "host-a"
+        nova.list_compute_services.return_value = [
+            ComputeService(
+                host="host-a", binary="nova-compute",
+                state="up", status="enabled",
+            ),
+            ComputeService(
+                host="host-b", binary="nova-compute",
+                state="down", status="enabled",
+            ),
+        ]
+
+        result = r.execute(_make_task())
+
+        assert not result.success
+        nova.live_migrate.assert_not_called()
+
+    def test_destination_missing_blocks(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Nova doesn't list a service for the destination - refuse."""
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.return_value = "host-a"
+        nova.list_compute_services.return_value = _all_up_services("host-a")
+
+        result = r.execute(_make_task())
+
+        assert not result.success
+        nova.live_migrate.assert_not_called()
+
+    def test_source_down_blocks(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Live migration cannot move a VM off a dead hypervisor."""
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.return_value = "host-a"
+        nova.list_compute_services.return_value = [
+            ComputeService(
+                host="host-a", binary="nova-compute",
+                state="down", status="enabled",
+            ),
+            ComputeService(
+                host="host-b", binary="nova-compute",
+                state="up", status="enabled",
+            ),
+        ]
+
+        result = r.execute(_make_task())
+
+        assert not result.success
+        assert "host-a" in result.error
+        nova.live_migrate.assert_not_called()
+
+    def test_source_disabled_blocks_non_evacuation(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Spread/pack tasks refuse a source that became disabled."""
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.return_value = "host-a"
+        nova.list_compute_services.return_value = [
+            ComputeService(
+                host="host-a", binary="nova-compute",
+                state="up", status="disabled",
+                disabled_reason="late-disable",
+            ),
+            ComputeService(
+                host="host-b", binary="nova-compute",
+                state="up", status="enabled",
+            ),
+        ]
+
+        result = r.execute(_make_task(phase=MigrationPhase.SPREAD))
+
+        assert not result.success
+        nova.live_migrate.assert_not_called()
+
+    def test_evacuation_phase_allows_disabled_source(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Evacuation tasks expect the source to be disabled - that's the point."""
+        r, nova = runner
+        nova.get_instance_status.side_effect = [
+            ("ACTIVE", None),  # pre-flight
+            ("ACTIVE", None),  # post-flight
+        ]
+        nova.get_instance_host.side_effect = [
+            "host-a",  # pre-flight
+            "host-b",  # post-flight
+        ]
+        nova.get_migration_status.return_value = None
+        nova.list_compute_services.return_value = [
+            ComputeService(
+                host="host-a", binary="nova-compute",
+                state="up", status="disabled",
+                disabled_reason="maintenance",
+            ),
+            ComputeService(
+                host="host-b", binary="nova-compute",
+                state="up", status="enabled",
+            ),
+        ]
+
+        result = r.execute(_make_task(phase=MigrationPhase.EVACUATE))
+
+        assert result.success
+        nova.live_migrate.assert_called_once_with("uuid-abc", "host-b")

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from oslo_log import log as logging
 
-from kronos.clients.nova import NovaClient
+from kronos.clients.nova import ComputeService, NovaClient
 from kronos.engine.types import VmProfile
 
 LOG = logging.getLogger(__name__)
@@ -65,6 +65,37 @@ class ConstraintChecker:
         self._nova = nova
         # Lazy-loaded cache; populated on first check() in a cycle.
         self._groups: list[ServerGroup] | None = None
+        # Per-cycle nova-compute service map (host -> ComputeService).
+        # The engine loop installs this every cycle via set_services();
+        # when it is None, every destination is considered unavailable.
+        self._services: dict[str, ComputeService] | None = None
+
+    def set_services(self, services: dict[str, ComputeService] | None) -> None:
+        """Install per-cycle nova-compute service state.
+
+        Called by the engine loop once per cycle.  When set, only hosts
+        whose nova-compute service is ``state=up`` and ``status=enabled``
+        (and not ``forced_down``) are accepted as live-migration
+        destinations.  When ``None`` the checker fails closed - no host
+        is treated as a valid destination.
+        """
+        self._services = services
+
+    def is_host_available_destination(self, host: str) -> bool:
+        """Return True if ``host`` can receive a live migration right now.
+
+        Fails closed: when service state has not been installed for
+        this cycle, or when ``host`` is missing from the installed
+        map, the host is rejected.  A host is also rejected when its
+        compute service is ``state=down``, ``status=disabled``, or
+        ``forced_down=true``.
+        """
+        if self._services is None:
+            return False
+        svc = self._services.get(host)
+        if svc is None:
+            return False
+        return svc.is_available_destination
 
     def check(
         self,
@@ -79,6 +110,15 @@ class ConstraintChecker:
         :param vms_by_host: Current VM placement (includes simulated moves).
         :returns: True if the move passes all constraint checks.
         """
+        if not self.is_host_available_destination(dest_host):
+            LOG.debug(
+                "Host availability: VM %s cannot move to %s "
+                "(nova-compute service unavailable).",
+                vm.instance_uuid,
+                dest_host,
+            )
+            return False
+
         groups = self._get_groups()
         if not groups:
             return True
@@ -228,5 +268,12 @@ class ConstraintChecker:
         return self._groups
 
     def invalidate_cache(self) -> None:
-        """Clear cached server groups (call between engine cycles)."""
+        """Clear cached server groups and service state.
+
+        Call between engine cycles.  Server groups are re-fetched lazily
+        on the next ``check()``.  Service state must be re-installed
+        via :meth:`set_services` before the planner runs - until then
+        the checker fails closed.
+        """
         self._groups = None
+        self._services = None

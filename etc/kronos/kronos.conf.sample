@@ -11,6 +11,13 @@
 # Path to the policies YAML file.
 # policies_file = /etc/kronos/policies.yaml
 
+# When true, plan migrations to evacuate VMs off compute hosts whose
+# nova-compute service is administratively disabled (status=disabled).
+# Evacuation runs before the affinity enforcer and the imbalance
+# planner and shares max_migrations_per_cycle as a single budget.
+# Hosts with state=down are skipped - live migration cannot drain them.
+# evacuate_disabled_hosts = false
+
 [prometheus]
 # Prometheus base URL (required).
 # url = http://prometheus:9090

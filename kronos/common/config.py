@@ -143,6 +143,19 @@ engine_opts = [
             "be honoured."
         ),
     ),
+    cfg.BoolOpt(
+        "evacuate_disabled_hosts",
+        default=False,
+        help=(
+            "When true, plan migrations to evacuate VMs off compute "
+            "hosts whose nova-compute service is administratively "
+            "disabled (status=disabled). Evacuation moves run before "
+            "the affinity enforcer and the imbalance planner, share "
+            "the same max_migrations_per_cycle budget, and pick "
+            "destinations that minimise combined imbalance without "
+            "breaching any policy threshold."
+        ),
+    ),
 ]
 
 prometheus_opts = [

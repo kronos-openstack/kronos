@@ -8,6 +8,7 @@ import pytest
 
 from kronos.clients.nova import (
     ComputeHost,
+    ComputeService,
     HostAggregate,
     Instance,
     NovaClient,
@@ -265,3 +266,99 @@ class TestListServerGroups:
         mock_nova_client._mock_conn.compute.server_groups.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list server groups"):
             mock_nova_client.list_server_groups()
+
+
+def _make_mock_service(
+    host="compute-01",
+    binary="nova-compute",
+    state="up",
+    status="enabled",
+    disabled_reason="",
+    forced_down=False,
+):
+    svc = MagicMock()
+    svc.host = host
+    svc.binary = binary
+    svc.state = state
+    svc.status = status
+    svc.disabled_reason = disabled_reason
+    svc.forced_down = forced_down
+    return svc
+
+
+class TestListComputeServices:
+    def test_filters_to_nova_compute(self, mock_nova_client):
+        """Only nova-compute entries are returned; conductor/scheduler dropped."""
+        services = [
+            _make_mock_service(host="h1", binary="nova-compute"),
+            _make_mock_service(host="h2", binary="nova-conductor"),
+            _make_mock_service(host="h3", binary="nova-compute"),
+            _make_mock_service(host="h4", binary="nova-scheduler"),
+        ]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+
+        assert len(result) == 2
+        assert {s.host for s in result} == {"h1", "h3"}
+        assert all(isinstance(s, ComputeService) for s in result)
+
+    def test_normalises_state_and_status_to_lowercase(self, mock_nova_client):
+        """Some Nova versions return upper-case enum values; lowercase them."""
+        services = [_make_mock_service(state="UP", status="ENABLED")]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+
+        assert result[0].state == "up"
+        assert result[0].status == "enabled"
+        assert result[0].is_available_destination is True
+
+    def test_disabled_host_not_available_destination(self, mock_nova_client):
+        services = [_make_mock_service(state="up", status="disabled")]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+        assert result[0].is_up is True
+        assert result[0].is_enabled is False
+        assert result[0].is_available_destination is False
+
+    def test_down_host_not_available_destination(self, mock_nova_client):
+        services = [_make_mock_service(state="down", status="enabled")]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+        assert result[0].is_up is False
+        assert result[0].is_available_destination is False
+
+    def test_forced_down_blocks_destination_even_when_state_up(
+        self, mock_nova_client,
+    ):
+        services = [
+            _make_mock_service(state="up", status="enabled", forced_down=True),
+        ]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+        assert result[0].forced_down is True
+        assert result[0].is_available_destination is False
+
+    def test_disabled_reason_carried_through(self, mock_nova_client):
+        services = [
+            _make_mock_service(
+                state="up", status="disabled", disabled_reason="maintenance",
+            ),
+        ]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+        assert result[0].disabled_reason == "maintenance"
+
+    def test_empty_list(self, mock_nova_client):
+        mock_nova_client._mock_conn.compute.services.return_value = []
+        assert mock_nova_client.list_compute_services() == []
+
+    def test_api_error(self, mock_nova_client):
+        mock_nova_client._mock_conn.compute.services.side_effect = Exception("fail")
+        with pytest.raises(NovaClientError, match="Failed to list compute services"):
+            mock_nova_client.list_compute_services()

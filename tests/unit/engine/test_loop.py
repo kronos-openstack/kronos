@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kronos.clients.nova import ComputeService
 from kronos.engine.cooldown import QUARANTINE_FOREVER
 from kronos.engine.loop import EngineLoop
 from kronos.engine.types import (
@@ -20,6 +21,19 @@ from kronos.engine.types import (
     VmProfile,
 )
 from kronos.policies.models import PoliciesConfig, PolicyConfig, PolicyMode
+
+
+def _make_compute_service(
+    host: str,
+    state: str = "up",
+    status: str = "enabled",
+) -> ComputeService:
+    return ComputeService(
+        host=host,
+        binary="nova-compute",
+        state=state,
+        status=status,
+    )
 
 
 def _make_policy(**overrides: object) -> PolicyConfig:
@@ -85,6 +99,7 @@ def mock_engine():
         patch("kronos.engine.loop.ConstraintChecker"),
         patch("kronos.engine.loop.Planner") as mock_planner_cls,
         patch("kronos.engine.loop.AffinityEnforcer") as mock_enforcer_cls,
+        patch("kronos.engine.loop.Evacuator") as mock_evacuator_cls,
     ):
         conf = MagicMock()
         conf.engine.evaluation_interval = 10
@@ -96,6 +111,7 @@ def mock_engine():
         conf.engine.include_unassigned_hosts = False
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
+        conf.engine.evacuate_disabled_hosts = False
 
         engine = EngineLoop(conf)
         engine._nova = mock_nova_cls.return_value
@@ -107,16 +123,47 @@ def mock_engine():
         # scores/vms_by_host passed through untouched.
         enforcer = mock_enforcer_cls.return_value
         enforcer.enabled = False
-        enforcer.enforce.return_value = (
-            MigrationPlan(aggregate="test-agg", policy_names=["test-policy"]),
-            {},
-            {},
-            0,
-        )
+
+        def _enforce_passthrough(
+            *, scores=None, vms_by_host=None, budget=0, **_kwargs,
+        ):
+            return (
+                MigrationPlan(
+                    aggregate="test-agg", policy_names=["test-policy"],
+                ),
+                scores if scores is not None else {},
+                vms_by_host if vms_by_host is not None else {},
+                budget,
+            )
+
+        enforcer.enforce.side_effect = _enforce_passthrough
         engine._enforcer = enforcer
 
-        # Default: one host in the test aggregate
+        # Default evacuator: disabled, passes scores/vms_by_host through.
+        evacuator = mock_evacuator_cls.return_value
+        evacuator.enabled = False
+
+        def _evacuate_passthrough(
+            *, scores=None, vms_by_host=None, budget=0, **_kwargs,
+        ):
+            return (
+                MigrationPlan(
+                    aggregate="test-agg", policy_names=["test-policy"],
+                ),
+                scores if scores is not None else {},
+                vms_by_host if vms_by_host is not None else {},
+                budget,
+            )
+
+        evacuator.evacuate.side_effect = _evacuate_passthrough
+        engine._evacuator = evacuator
+
+        # Default: one host in the test aggregate, both up + enabled.
         engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2"]
+        engine._nova.list_compute_services.return_value = [
+            _make_compute_service("h1"),
+            _make_compute_service("h2"),
+        ]
         yield engine
 
 
@@ -223,6 +270,7 @@ class TestEvaluateAggregate:
         mock_engine._nova.get_hosts_in_aggregate.return_value = []
         result = mock_engine._evaluate_aggregate(
             "empty-agg", [_make_policy()], dry_run=True,
+            services={"h1": _make_compute_service("h1")},
         )
         assert result.aggregate == "empty-agg"
         assert not result.imbalance_detected
@@ -231,6 +279,10 @@ class TestEvaluateAggregate:
         mock_engine._scorer.evaluate.return_value = _make_policy_result()
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
         )
 
         assert result.migration_plan is None
@@ -241,6 +293,10 @@ class TestEvaluateAggregate:
         mock_engine._scorer.evaluate.return_value = _make_policy_result(skipped=True)
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
         )
 
         assert not result.imbalance_detected
@@ -253,6 +309,10 @@ class TestEvaluateAggregate:
 
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
         )
 
         mock_engine._profiler.collect.assert_called_once()
@@ -266,6 +326,10 @@ class TestEvaluateAggregate:
 
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
         )
 
         mock_engine._planner.plan.assert_not_called()

@@ -95,9 +95,17 @@ class AffinityEnforcer:
         policy_results: list[PolicyResult],
         vm_profiles: dict[str, VmProfile],
         budget: int,
+        scores: PolicyScores | None = None,
+        vms_by_host: dict[str, list[VmProfile]] | None = None,
     ) -> tuple[MigrationPlan, PolicyScores, dict[str, list[VmProfile]], int]:
         """Plan repair migrations for this aggregate.
 
+        :param scores: Optional pre-simulated per-policy scores (e.g.
+            the state after the evacuator applied its moves).  When
+            provided, the enforcer chains from this state instead of
+            rebuilding it from ``policy_results``.
+        :param vms_by_host: Optional pre-simulated VM placement index.
+            Must be consistent with ``scores`` when both are given.
         :returns: ``(plan, scores, vms_by_host, remaining_budget)``.
             ``scores`` and ``vms_by_host`` reflect the simulated state
             after all repair steps have been applied - the imbalance
@@ -114,11 +122,13 @@ class AffinityEnforcer:
             if not r.skipped and r.host_scores
         ]
         active_policies = [p for p, _ in active]
-        scores: PolicyScores = {
-            p.name: {hs.host: hs.raw_score for hs in r.host_scores}
-            for p, r in active
-        }
-        vms_by_host = group_vms_by_host(vm_profiles)
+        if scores is None:
+            scores = {
+                p.name: {hs.host: hs.raw_score for hs in r.host_scores}
+                for p, r in active
+            }
+        if vms_by_host is None:
+            vms_by_host = group_vms_by_host(vm_profiles)
 
         if not self.enabled or budget <= 0 or not active_policies:
             return plan, scores, vms_by_host, budget

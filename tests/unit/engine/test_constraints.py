@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from kronos.clients.nova import ComputeService
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.types import VmProfile
 
@@ -20,6 +21,19 @@ def _vm(uuid: str, host: str = "h1") -> VmProfile:
     )
 
 
+def _all_up_services(*hosts: str) -> dict[str, ComputeService]:
+    """Permissive service map: every host is up + enabled."""
+    return {
+        h: ComputeService(
+            host=h,
+            binary="nova-compute",
+            state="up",
+            status="enabled",
+        )
+        for h in hosts
+    }
+
+
 @pytest.fixture()
 def mock_nova() -> MagicMock:
     return MagicMock()
@@ -27,7 +41,11 @@ def mock_nova() -> MagicMock:
 
 @pytest.fixture()
 def checker(mock_nova: MagicMock) -> ConstraintChecker:
-    return ConstraintChecker(mock_nova)
+    c = ConstraintChecker(mock_nova)
+    # Server-group tests don't care about service state; install a
+    # permissive map so the host-availability gate is a no-op.
+    c.set_services(_all_up_services("h1", "h2", "h3"))
+    return c
 
 
 class TestAntiAffinity:
@@ -98,8 +116,11 @@ class TestAntiAffinity:
         checker.check(_vm("vm-1"), "h2", {})
         assert mock_nova.list_server_groups.call_count == 1
 
-        # After invalidation, fetches again
+        # invalidate_cache clears both server groups and the service
+        # map; the engine re-installs services every cycle right after
+        # invalidating, so the test mirrors that flow.
         checker.invalidate_cache()
+        checker.set_services(_all_up_services("h1", "h2"))
         checker.check(_vm("vm-1"), "h2", {})
         assert mock_nova.list_server_groups.call_count == 2
 
@@ -217,3 +238,100 @@ class TestAffinity:
         # h3 has vm-3 (anti-affinity violated) regardless of affinity.
         vms = {"h3": [_vm("vm-2", "h3"), _vm("vm-3", "h3")]}
         assert checker.check(vm, "h3", vms) is False
+
+
+class TestServiceStateGate:
+    """Host-availability gate: destination must be up + enabled."""
+
+    def test_no_services_installed_fails_closed(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        """Without an installed service map, every destination is rejected."""
+        c = ConstraintChecker(mock_nova)
+        # Note: deliberately not calling set_services().
+        mock_nova.list_server_groups.return_value = []
+        assert c.is_host_available_destination("h1") is False
+        assert c.check(_vm("vm-1"), "h1", {}) is False
+
+    def test_host_missing_from_service_map_rejected(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        c = ConstraintChecker(mock_nova)
+        c.set_services(_all_up_services("h1"))  # h2 missing
+        assert c.is_host_available_destination("h2") is False
+
+    def test_disabled_service_rejected_as_destination(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        c = ConstraintChecker(mock_nova)
+        c.set_services({
+            "h1": ComputeService(
+                host="h1",
+                binary="nova-compute",
+                state="up",
+                status="disabled",
+            ),
+        })
+        assert c.is_host_available_destination("h1") is False
+
+    def test_down_service_rejected_as_destination(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        c = ConstraintChecker(mock_nova)
+        c.set_services({
+            "h1": ComputeService(
+                host="h1",
+                binary="nova-compute",
+                state="down",
+                status="enabled",
+            ),
+        })
+        assert c.is_host_available_destination("h1") is False
+
+    def test_forced_down_rejected_as_destination(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        c = ConstraintChecker(mock_nova)
+        c.set_services({
+            "h1": ComputeService(
+                host="h1",
+                binary="nova-compute",
+                state="up",
+                status="enabled",
+                forced_down=True,
+            ),
+        })
+        assert c.is_host_available_destination("h1") is False
+
+    def test_check_blocks_when_service_state_unfit(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        """Service-state gate runs before any server-group logic."""
+        c = ConstraintChecker(mock_nova)
+        c.set_services({
+            "h1": ComputeService(
+                host="h1",
+                binary="nova-compute",
+                state="up",
+                status="enabled",
+            ),
+            "h2": ComputeService(
+                host="h2",
+                binary="nova-compute",
+                state="up",
+                status="disabled",
+            ),
+        })
+        mock_nova.list_server_groups.return_value = []
+        # No server group involvement; pure service-state veto.
+        assert c.check(_vm("vm-1"), "h2", {}) is False
+
+    def test_invalidate_cache_clears_services(
+        self, mock_nova: MagicMock,
+    ) -> None:
+        c = ConstraintChecker(mock_nova)
+        c.set_services(_all_up_services("h1", "h2"))
+        assert c.is_host_available_destination("h1") is True
+
+        c.invalidate_cache()
+        assert c.is_host_available_destination("h1") is False

@@ -13,6 +13,10 @@ from kronos.policies.models import PolicyMode
 class MigrationPhase(enum.StrEnum):
     """Why a migration step was proposed.
 
+    ``evacuate``: emitted by the evacuator to drain a host whose
+    nova-compute service has been administratively disabled (only
+    when ``[engine] evacuate_disabled_hosts`` is set).
+
     ``affinity``: emitted by the affinity enforcer to repair a Nova
     server-group violation.
 
@@ -21,6 +25,7 @@ class MigrationPhase(enum.StrEnum):
     ``pack``: emitted by the imbalance planner in pack mode.
     """
 
+    EVACUATE = "evacuate"
     AFFINITY = "affinity"
     SPREAD = "spread"
     PACK = "pack"

@@ -16,14 +16,16 @@ from pathlib import Path
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from kronos.clients.nova import Instance
+from kronos.clients.nova import ComputeService, Instance
 from kronos.clients.prometheus import PrometheusHealth, QueryResult
 from kronos.common.config import register_opts
 from kronos.common.exceptions import AggregateNotFound
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
+from kronos.engine._sim import combined_imbalance, group_vms_by_host
 from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
+from kronos.engine.evacuator import Evacuator
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.scorer import PolicyScorer
@@ -48,6 +50,38 @@ class ReplayNovaClient:
         self._server_groups: list[dict[str, object]] = json.loads(
             (nova_dir / "server_groups.json").read_text(),
         )
+
+        # nova-compute service state - optional for backwards compat
+        # with older snapshots that pre-date the host-liveness gate.
+        # When the file is missing, synthesise an "all up + enabled"
+        # map covering every host we know about so the replay still
+        # produces destinations.
+        services_path = nova_dir / "services.json"
+        if services_path.exists():
+            self._services: list[ComputeService] = [
+                ComputeService(
+                    host=str(d.get("host", "")),
+                    binary=str(d.get("binary", "nova-compute")),
+                    state=str(d.get("state", "up")),
+                    status=str(d.get("status", "enabled")),
+                    disabled_reason=str(d.get("disabled_reason", "")),
+                    forced_down=bool(d.get("forced_down", False)),
+                )
+                for d in json.loads(services_path.read_text())
+            ]
+        else:
+            all_hosts: set[str] = set()
+            for hosts in self._aggregates.values():
+                all_hosts.update(hosts)
+            self._services = [
+                ComputeService(
+                    host=h,
+                    binary="nova-compute",
+                    state="up",
+                    status="enabled",
+                )
+                for h in sorted(all_hosts)
+            ]
 
     def get_hosts_in_aggregate(
         self, aggregate_name: str | None,
@@ -79,6 +113,9 @@ class ReplayNovaClient:
 
     def list_server_groups(self) -> list[dict[str, object]]:
         return self._server_groups
+
+    def list_compute_services(self) -> list[ComputeService]:
+        return list(self._services)
 
 
 class ReplayPrometheusClient:
@@ -131,6 +168,7 @@ def _run_replay(
     *,
     enforce_hard: bool,
     enforce_soft: bool,
+    evacuate_disabled: bool,
     show_timings: bool,
     cooldown: CooldownTracker,
 ) -> int:
@@ -146,7 +184,11 @@ def _run_replay(
         enforce_hard=enforce_hard,
         enforce_soft=enforce_soft,
     )
+    evacuator = Evacuator(constraints, enabled=evacuate_disabled)
     planner = Planner(constraints)
+
+    services = {svc.host: svc for svc in nova.list_compute_services()}
+    constraints.set_services(services)
 
     policies = load_policies(policies_file)
     enabled = [p for p in policies.policies if p.enabled]
@@ -159,6 +201,7 @@ def _run_replay(
     totals: dict[str, float] = {
         "scorer": 0.0,
         "profiler": 0.0,
+        "evacuator": 0.0,
         "enforcer": 0.0,
         "planner": 0.0,
     }
@@ -181,7 +224,7 @@ def _run_replay(
         policy_results = [scorer.evaluate(p, hosts) for p in enabled]
         totals["scorer"] += time.perf_counter() - t0
 
-        combined_imbalance = 0.0
+        weighted_imbalance = 0.0
         any_detected = False
         name_width = max(
             (len(pr.policy_name) for pr in policy_results),
@@ -194,7 +237,7 @@ def _run_replay(
                     name_width, pr.policy_name, pr.skip_reason,
                 )
                 continue
-            combined_imbalance += policy.weight * pr.imbalance
+            weighted_imbalance += policy.weight * pr.imbalance
             if pr.imbalance_detected:
                 any_detected = True
             suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
@@ -204,9 +247,9 @@ def _run_replay(
                 policy.threshold, suffix,
             )
 
-        LOG.info("  Combined imbalance: %.3f", combined_imbalance)
+        LOG.info("  Combined imbalance: %.3f", weighted_imbalance)
 
-        if not any_detected and not enforcer.enabled:
+        if not any_detected and not enforcer.enabled and not evacuator.enabled:
             continue
 
         active = [
@@ -239,14 +282,43 @@ def _run_replay(
 
         budget = max(p.max_migrations_per_cycle for p in active_policies)
 
+        scores = {
+            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
+            for p, pr in active
+        }
+        vms_by_host = group_vms_by_host(vm_profiles)
+
+        plan = MigrationPlan(
+            aggregate=name,
+            policy_names=[p.name for p in active_policies],
+            initial_imbalance=combined_imbalance(scores, active_policies),
+        )
+
         t0 = time.perf_counter()
-        plan, scores, vms_by_host, remaining = enforcer.enforce(
+        evac_plan, scores, vms_by_host, remaining = evacuator.evacuate(
+            aggregate=name,
+            aggregate_hosts=hosts,
+            policies=active_policies,
+            scores=scores,
+            vms_by_host=vms_by_host,
+            vm_profiles=vm_profiles,
+            services=services,
+            budget=budget,
+        )
+        plan.steps.extend(evac_plan.steps)
+        totals["evacuator"] += time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        enforce_plan, scores, vms_by_host, remaining = enforcer.enforce(
             aggregate=name,
             policies=active_policies,
             policy_results=active_results,
             vm_profiles=vm_profiles,
-            budget=budget,
+            budget=remaining,
+            scores=scores,
+            vms_by_host=vms_by_host,
         )
+        plan.steps.extend(enforce_plan.steps)
         totals["enforcer"] += time.perf_counter() - t0
 
         if any_detected:
@@ -263,6 +335,7 @@ def _run_replay(
             )
             totals["planner"] += time.perf_counter() - t0
 
+        plan.projected_imbalance = combined_imbalance(scores, active_policies)
         _log_plan(plan)
 
     if show_timings:
@@ -425,6 +498,7 @@ def main() -> int:
         CONF.engine.policies_file,
         enforce_hard=CONF.engine.enforce_hard_affinity,
         enforce_soft=CONF.engine.enforce_soft_affinity,
+        evacuate_disabled=CONF.engine.evacuate_disabled_hosts,
         show_timings=CONF["time"],
         cooldown=cooldown,
     )

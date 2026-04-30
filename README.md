@@ -63,8 +63,18 @@ them out through the Nova live-migrate API.
 7. **Cooldown tracker** prevents oscillation via aggregate-level and
    instance-level cooldowns, and quarantines VMs whose migration has
    definitively failed so the planner stops re-proposing them.
-8. **Executor** consumes migration tasks, validates pre-flight state, calls
-   Nova live-migrate, polls until completion, and verifies post-flight.
+8. **Host liveness** is checked every cycle: only nova-compute hosts
+   that are `state=up` and `status=enabled` (and not `forced_down`) are
+   accepted as live-migration destinations. VMs whose source host is
+   down or missing from Nova's view drop out of the candidate set.
+9. **Evacuator** (optional) drains VMs off hosts whose nova-compute
+   service is `status=disabled`. Enable per engine via
+   `[engine] evacuate_disabled_hosts`. Evacuation runs before the
+   affinity enforcer and the imbalance planner and shares the same
+   `max_migrations_per_cycle` budget.
+10. **Executor** consumes migration tasks, validates pre-flight state,
+    re-checks service state for source and destination, calls Nova
+    live-migrate, polls until completion, and verifies post-flight.
 
 ## Quick Start
 
@@ -126,6 +136,10 @@ instance_quarantine_seconds = 3600
 # Both off by default.
 enforce_hard_affinity = false
 enforce_soft_affinity = false
+
+# Optional: evacuate VMs off hosts whose nova-compute service is
+# administratively disabled (status=disabled). Off by default.
+evacuate_disabled_hosts = false
 
 [prometheus]
 url = http://prometheus:9090
@@ -247,28 +261,37 @@ evaluates all enabled policies against each aggregate every cycle:
 
 1. **Score** - each policy runs its PromQL imbalance query; values must be in [0, 1]
 2. **Profile** - collect per-VM resource weights *across all policies* in one pass
-3. **Constrain** - reject any move that would break a Nova server-group placement rule
-4. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
+3. **Host liveness** - fetch nova-compute service state once per cycle. Only
+   hosts that are `state=up` and `status=enabled` (and not `forced_down`)
+   are accepted as live-migration destinations; VMs whose source host is
+   `state=down` are dropped from the candidate set.
+4. **Constrain** - reject any move that would break a Nova server-group placement rule
+5. **Evacuate** (optional) - when `evacuate_disabled_hosts` is set,
+   propose moves for VMs sitting on hosts whose nova-compute service is
+   `status=disabled`. Runs before the affinity enforcer.
+6. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
    propose repair moves for VMs already violating their groups
-5. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
-   per-cycle migration budget with the enforcer
-6. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
-   task carries a `phase` field (`affinity`, `spread`, or `pack`) that surfaces in
-   logs so operators can see why each migration was proposed
-7. **Cooldown** - record aggregate-level and instance-level cooldown on plan
+7. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
+   per-cycle migration budget with the evacuator and enforcer
+8. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
+   task carries a `phase` field (`evacuate`, `affinity`, `spread`, or `pack`) that
+   surfaces in logs so operators can see why each migration was proposed
+9. **Cooldown** - record aggregate-level and instance-level cooldown on plan
    emission; skip VMs already in cooldown or quarantine on the next cycle
-8. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
-   VMs on a definitive failure (PreFlightError, MigrationFailed,
-   MigrationTimeout) so the planner stops re-proposing them. Transient
-   NovaClientError failures are not quarantined; the normal instance
-   cooldown governs re-planning.
+10. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
+    VMs on a definitive failure (PreFlightError, MigrationFailed,
+    MigrationTimeout) so the planner stops re-proposing them. Transient
+    NovaClientError failures are not quarantined; the normal instance
+    cooldown governs re-planning.
 
 ### Executor (migration runner)
 
 One executor per aggregate consumes tasks from RabbitMQ:
 
 1. **Schedule** - priority queue sorted by `not_before` timestamps, semaphore for concurrency
-2. **Pre-flight** - verify instance is ACTIVE, no pending task_state, still on source host
+2. **Pre-flight** - verify instance is ACTIVE, no pending task_state, still on source host;
+   re-fetch source + destination nova-compute services and refuse if either is no longer
+   up + enabled (evacuation tasks tolerate a `status=disabled` source - that's the point)
 3. **Migrate** - call Nova live-migrate API
 4. **Poll** - check migration status until terminal state or timeout
 5. **Post-flight** - confirm instance landed on destination host and is ACTIVE
@@ -340,7 +363,7 @@ enforcer, planner) so you can see where cycles are spent.
 | **M2** | VM profiling, simulation-based migration planning, constraint checking, record/replay | Done |
 | **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
 | **M4** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
-| **M5** | Pre-migration host: nova-compute service liveness on source and destination. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly. evacuate_disbled_hosts | Planned |
+| **M5** | Pre-migration host: nova-compute service liveness on source and destination, evacuator for admin-disabled hosts. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly. | Done |
 | **M6** | AZ awareness: discover Nova availability zones, surface them in logs and cycle reports, optionally restrict migrations to within an AZ (configurable, cross-AZ not allowed by default) | Planned |
 | **M7** | Audit logging (append-only JSONL) and general logging cleanup: no leading whitespace, no multiline LOG calls, single format string per call (OpenStack-standard oslo.log style) | Planned |
 | **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Planned |
