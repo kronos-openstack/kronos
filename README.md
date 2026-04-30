@@ -340,7 +340,7 @@ enforcer, planner) so you can see where cycles are spent.
 | **M2** | VM profiling, simulation-based migration planning, constraint checking, record/replay | Done |
 | **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
 | **M4** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
-| **M5** | Pre-migration live-migratability validation: local/ephemeral storage on source, CPU feature/mask compatibility between source and dest, host liveness | Planned |
+| **M5** | Pre-migration host & CPU validation: nova-compute service liveness on source and destination, CPU feature/mask compatibility between source and dest. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly | Planned |
 | **M6** | AZ awareness: discover Nova availability zones, surface them in logs and cycle reports, optionally restrict migrations to within an AZ (configurable, cross-AZ allowed by default) | Planned |
 | **M7** | Audit logging (append-only JSONL) and general logging cleanup: no leading whitespace, no multiline LOG calls, single format string per call (OpenStack-standard oslo.log style) | Planned |
 | **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Planned |
