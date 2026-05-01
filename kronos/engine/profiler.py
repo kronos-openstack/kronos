@@ -52,7 +52,7 @@ class VmProfiler:
         :param hosts: Hostnames in the aggregate.
         :param host_scores_by_policy: ``{policy_name: {host: raw_score}}``
             (used by fallback strategies).
-        :returns: Mapping of instance UUID → VmProfile (with per-policy weights).
+        :returns: Mapping of instance UUID -> VmProfile (with per-policy weights).
         """
         instances = self._collect_instances(hosts)
         if not instances:

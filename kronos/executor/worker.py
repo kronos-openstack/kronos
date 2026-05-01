@@ -69,8 +69,8 @@ class ExecutorWorker:
     """Top-level executor for one aggregate.
 
     Wires together:
-      - RPC server: consumes migration tasks (engine → executor)
-      - Notifier: publishes migration results (executor → engines)
+      - RPC server: consumes migration tasks (engine -> executor)
+      - Notifier: publishes migration results (executor -> engines)
       - Scheduler: respects ``not_before`` and concurrency limits
       - Migration runner: pre-flight, Nova live-migrate, post-flight
       - Retry notifier: re-casts failed tasks to the RPC topic
@@ -87,8 +87,8 @@ class ExecutorWorker:
         self._nova = NovaClient(conf)
         self._runner = MigrationRunner(conf, self._nova)
 
-        # Two transports: one for RPC (engine ↔ executor),
-        # one for notifications (executor → engines)
+        # Two transports: one for RPC (engine <-> executor),
+        # one for notifications (executor -> engines)
         self._rpc_transport = get_rpc_transport(conf)
         self._notification_transport = get_notification_transport(conf)
 

@@ -25,11 +25,11 @@ EXIT_AGGREGATE_ERROR = 4
 
 
 def _print_ok(msg: str) -> None:
-    print(f"  \u2713 {msg}")
+    print(f"[OK] {msg}")
 
 
 def _print_fail(msg: str) -> None:
-    print(f"  \u2717 {msg}")
+    print(f"[FAIL] {msg}")
 
 
 def main() -> int:
@@ -56,7 +56,7 @@ def main() -> int:
         )
         for p in policies.policies:
             status = "enabled" if p.enabled else "disabled"
-            print(f"      {p.name} [{p.mode.value}] weight={p.weight} ({status})")
+            print(f"{p.name} [{p.mode.value}] weight={p.weight} ({status})")
     except KronosException as exc:
         _print_fail(f"Policy file error: {exc}")
         return EXIT_CONFIG_ERROR
@@ -130,7 +130,7 @@ def main() -> int:
                 f"{len(result.series)} series returned (health={result.health.value})"
             )
             for host, score in sorted(result.series.items()):
-                print(f"      {host}: {score:.3f}")
+                print(f"{host}: {score:.3f}")
         except KronosException as exc:
             _print_fail(f"Policy '{p.name}' query error: {exc}")
 

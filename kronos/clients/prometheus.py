@@ -77,6 +77,8 @@ class PrometheusClient:
         token = self._resolve_bearer_token(prom)
         if token:
             self._session.headers["Authorization"] = f"Bearer {token}"
+        elif prom.username and prom.password:
+            self._session.auth = (prom.username, prom.password)
 
     @staticmethod
     def _resolve_bearer_token(prom: cfg.ConfigOpts) -> str | None:

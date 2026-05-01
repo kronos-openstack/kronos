@@ -154,7 +154,12 @@ user_domain_name = Default
 project_domain_name = Default
 
 [messaging]
-transport_url = rabbit://guest:guest@localhost:5672/
+transport = rabbit
+host = localhost
+port = 5672
+username = guest
+password = guest
+virtual_host = /
 
 [executor]
 max_concurrent_migrations = 2

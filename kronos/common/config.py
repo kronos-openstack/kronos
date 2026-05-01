@@ -10,8 +10,33 @@ from oslo_config import cfg
 
 messaging_opts = [
     cfg.StrOpt(
-        "transport_url",
-        help="oslo.messaging transport URL (e.g. rabbit://guest:guest@localhost:5672/).",
+        "transport",
+        default="rabbit",
+        help="oslo.messaging transport driver (e.g. rabbit, kafka).",
+    ),
+    cfg.HostAddressOpt(
+        "host",
+        default="localhost",
+        help="Message broker hostname or IP.",
+    ),
+    cfg.PortOpt(
+        "port",
+        default=5672,
+        help="Message broker port.",
+    ),
+    cfg.StrOpt(
+        "username",
+        help="Username for the message broker.",
+    ),
+    cfg.StrOpt(
+        "password",
+        secret=True,
+        help="Password for the message broker.",
+    ),
+    cfg.StrOpt(
+        "virtual_host",
+        default="/",
+        help="Virtual host on the message broker.",
     ),
 ]
 
@@ -205,6 +230,15 @@ prometheus_opts = [
     cfg.StrOpt(
         "bearer_token_file",
         help="Path to file containing bearer token for Prometheus authentication.",
+    ),
+    cfg.StrOpt(
+        "username",
+        help="Username for HTTP basic auth against Prometheus.",
+    ),
+    cfg.StrOpt(
+        "password",
+        secret=True,
+        help="Password for HTTP basic auth against Prometheus.",
     ),
 ]
 

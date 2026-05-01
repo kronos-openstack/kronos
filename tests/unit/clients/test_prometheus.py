@@ -33,6 +33,8 @@ def _make_conf(url: str = PROM_URL, **overrides) -> MagicMock:
     prom.ca_cert = overrides.get("ca_cert")
     prom.bearer_token = overrides.get("bearer_token")
     prom.bearer_token_file = overrides.get("bearer_token_file")
+    prom.username = overrides.get("username")
+    prom.password = overrides.get("password")
 
     conf = MagicMock()
     conf.prometheus = prom

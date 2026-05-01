@@ -2,16 +2,17 @@
 
 Two message flows:
 
-- **Engine → Executor**: RPC cast (exactly-one delivery, competing consumers
+- **Engine -> Executor**: RPC cast (exactly-one delivery, competing consumers
   semantics). Work queue - we want one executor to pick up each migration
   task, not broadcast.
-- **Executor → Engine(s)**: Notifications (broadcast, multiple listeners).
+- **Executor -> Engine(s)**: Notifications (broadcast, multiple listeners).
   Both active and passive engines subscribe to keep cooldown state warm.
 
 Two transports because oslo.messaging uses separate transport instances
-for RPC vs notifications.  They read the same ``transport_url``, but
-notifications can override via ``[oslo_messaging_notifications]
-transport_url`` if desired.
+for RPC vs notifications.  Both are built from the same ``[messaging]``
+options (``host``, ``port``, ``username``, ``password``,
+``virtual_host``, ``transport``) so credentials never appear in a
+single embedded URL string.
 """
 
 from __future__ import annotations
@@ -32,21 +33,38 @@ if TYPE_CHECKING:
 LOG = logging.getLogger(__name__)
 
 
+def _build_transport_url(conf: cfg.ConfigOpts) -> oslo_messaging.TransportURL:
+    msg = conf[MESSAGING_GROUP]
+    return oslo_messaging.TransportURL(
+        conf,
+        transport=msg.transport,
+        virtual_host=msg.virtual_host,
+        hosts=[
+            oslo_messaging.TransportHost(
+                hostname=msg.host,
+                port=msg.port,
+                username=msg.username,
+                password=msg.password,
+            ),
+        ],
+    )
+
+
 def get_rpc_transport(conf: cfg.ConfigOpts) -> oslo_messaging.Transport:
-    """Create an oslo.messaging RPC transport (for engine→executor)."""
-    url = conf[MESSAGING_GROUP].transport_url
-    return oslo_messaging.get_rpc_transport(conf, url=url)
+    """Create an oslo.messaging RPC transport (for engine->executor)."""
+    return oslo_messaging.get_rpc_transport(conf, url=_build_transport_url(conf))
 
 
 def get_notification_transport(
     conf: cfg.ConfigOpts,
 ) -> oslo_messaging.Transport:
-    """Create an oslo.messaging notification transport (for executor→engine)."""
-    url = conf[MESSAGING_GROUP].transport_url
-    return oslo_messaging.get_notification_transport(conf, url=url)
+    """Create an oslo.messaging notification transport (for executor->engine)."""
+    return oslo_messaging.get_notification_transport(
+        conf, url=_build_transport_url(conf),
+    )
 
 
-# --- RPC (engine → executor) ---
+# --- RPC (engine -> executor) ---
 
 
 # Topic component used when an aggregate is the unassigned-hosts pool.
@@ -111,7 +129,7 @@ def get_rpc_server(
     )
 
 
-# --- Notifications (executor → engine) ---
+# --- Notifications (executor -> engine) ---
 
 
 def results_topic(aggregate: str | None) -> str:

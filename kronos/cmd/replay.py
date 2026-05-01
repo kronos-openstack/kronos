@@ -213,11 +213,11 @@ def _run_replay(
 
         hosts = nova.get_hosts_in_aggregate(aggregate)
         if not hosts:
-            LOG.info("  No hosts recorded, skipping.")
+            LOG.info("No hosts recorded, skipping.")
             continue
 
         if cooldown.is_aggregate_cooling(name):
-            LOG.info("  Aggregate '%s' is cooling, skipping planning.", name)
+            LOG.info("Aggregate '%s' is cooling, skipping planning.", name)
             continue
 
         t0 = time.perf_counter()
@@ -226,15 +226,11 @@ def _run_replay(
 
         weighted_imbalance = 0.0
         any_detected = False
-        name_width = max(
-            (len(pr.policy_name) for pr in policy_results),
-            default=0,
-        )
         for policy, pr in zip(enabled, policy_results, strict=True):
             if pr.skipped:
                 LOG.info(
-                    "  policy %-*s skipped (%s)",
-                    name_width, pr.policy_name, pr.skip_reason,
+                    "policy %s skipped (%s)",
+                    pr.policy_name, pr.skip_reason,
                 )
                 continue
             weighted_imbalance += policy.weight * pr.imbalance
@@ -242,12 +238,12 @@ def _run_replay(
                 any_detected = True
             suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
             LOG.info(
-                "  policy %-*s imbalance %.3f (threshold %.3f)%s",
-                name_width, pr.policy_name, pr.imbalance,
+                "policy %s imbalance %.3f (threshold %.3f)%s",
+                pr.policy_name, pr.imbalance,
                 policy.threshold, suffix,
             )
 
-        LOG.info("  Combined imbalance: %.3f", weighted_imbalance)
+        LOG.info("Combined imbalance: %.3f", weighted_imbalance)
 
         if not any_detected and not enforcer.enabled and not evacuator.enabled:
             continue
@@ -257,7 +253,7 @@ def _run_replay(
             if not pr.skipped
         ]
         if not active:
-            LOG.info("  No active policies, cannot plan.")
+            LOG.info("No active policies, cannot plan.")
             continue
         active_policies = [p for p, _ in active]
         active_results = [pr for _, pr in active]
@@ -277,7 +273,7 @@ def _run_replay(
         vm_profiles = _filter_unavailable(vm_profiles, cooldown, name)
 
         if not vm_profiles:
-            LOG.info("  No VM profiles collected, cannot plan.")
+            LOG.info("No VM profiles collected, cannot plan.")
             continue
 
         budget = max(p.max_migrations_per_cycle for p in active_policies)
@@ -343,8 +339,8 @@ def _run_replay(
         LOG.info("--- Timings ---")
         for phase, seconds in totals.items():
             pct = (seconds / total * 100.0) if total else 0.0
-            LOG.info("  %-10s %.3fs  (%.1f%%)", phase, seconds, pct)
-        LOG.info("  %-10s %.3fs  (100.0%%)", "total", total)
+            LOG.info("%s %.3fs (%.1f%%)", phase, seconds, pct)
+        LOG.info("%s %.3fs (100.0%%)", "total", total)
 
     return 0
 
@@ -367,7 +363,7 @@ def _filter_unavailable(
         kept[instance_uuid] = profile
     if skipped:
         LOG.info(
-            "  Excluded %d VM(s) from planning in '%s': %s",
+            "Excluded %d VM(s) from planning in '%s': %s",
             len(skipped),
             aggregate,
             ", ".join(skipped),
@@ -420,18 +416,18 @@ def _load_cooldowns(
 
 def _log_plan(plan: MigrationPlan) -> None:
     if not plan.steps:
-        LOG.info("  No migrations proposed.")
+        LOG.info("No migrations proposed.")
         return
 
     LOG.info(
-        "  Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
+        "Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
         plan.migration_count,
         plan.initial_imbalance,
         plan.projected_imbalance,
     )
     for i, step in enumerate(plan.steps, 1):
         LOG.info(
-            "    %d. %-8s %s (%s) %s -> %s, gain %.4f",
+            "%d. %s %s (%s) %s -> %s, gain %.4f",
             i,
             step.phase.value,
             step.instance_name,

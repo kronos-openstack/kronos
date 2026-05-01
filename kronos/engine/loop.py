@@ -4,7 +4,7 @@ The engine operates on a fixed set of aggregates defined at startup via
 ``[engine] aggregates`` and ``[engine] include_unassigned_hosts``.  Each
 aggregate is evaluated independently every cycle:
 
-1. resolve aggregate → host list via Nova
+1. resolve aggregate -> host list via Nova
 2. run every enabled policy against that host list (scorer)
 3. collect VM profiles for all policies in one pass (profiler)
 4. combined-scoring planner produces at most one migration plan
@@ -592,25 +592,21 @@ class EngineLoop:
                 ar.combined_imbalance,
             )
 
-        name_width = max(
-            (len(pr.policy_name) for pr in ar.policy_results),
-            default=0,
-        )
         for pr in ar.policy_results:
             if pr.skipped:
                 LOG.info(
-                    "  policy %-*s skipped (%s)",
-                    name_width, pr.policy_name, pr.skip_reason,
+                    "policy %s skipped (%s)",
+                    pr.policy_name, pr.skip_reason,
                 )
                 continue
             suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
             LOG.info(
-                "  policy %-*s imbalance %.3f%s",
-                name_width, pr.policy_name, pr.imbalance, suffix,
+                "policy %s imbalance %.3f%s",
+                pr.policy_name, pr.imbalance, suffix,
             )
             for hs in pr.host_scores:
                 LOG.debug(
-                    "    host %s raw=%.3f normalized=%.3f",
+                    "host %s raw=%.3f normalized=%.3f",
                     hs.host, hs.raw_score, hs.normalized_score,
                 )
 
@@ -622,14 +618,14 @@ class EngineLoop:
             return
 
         LOG.info(
-            "  Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
+            "Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
             plan.migration_count,
             plan.initial_imbalance,
             plan.projected_imbalance,
         )
         for i, step in enumerate(plan.steps, 1):
             LOG.info(
-                "    %d. %-8s %s (%s) %s -> %s, gain %.3f",
+                "%d. %s %s (%s) %s -> %s, gain %.3f",
                 i,
                 step.phase.value,
                 step.instance_name,

@@ -1,4 +1,4 @@
-"""Policy evaluation: PromQL queries → per-host scores."""
+"""Policy evaluation: PromQL queries -> per-host scores."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ LOG = logging.getLogger(__name__)
 class PolicyScorer:
     """Evaluates a single policy's PromQL imbalance query against a set of hosts.
 
-    The engine resolves the aggregate → host list and hands it to the
+    The engine resolves the aggregate -> host list and hands it to the
     scorer.  The scorer runs the PromQL query, matches results to the
     host list, normalises the values, enforces the [0, 1] contract, and
     detects imbalance.
