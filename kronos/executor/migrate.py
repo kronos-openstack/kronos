@@ -29,6 +29,8 @@ class MigrationRunner:
     """Executes a single live migration against the Nova API.
 
     Lifecycle:
+      0. No-op short-circuit if the instance is already on to_host
+         (e.g. completed by an earlier dispatch, manual move out of band)
       1. Pre-flight check - instance is ACTIVE, idle, still on from_host
       2. Call Nova live-migrate
       3. Poll migration status until terminal or timeout
@@ -48,6 +50,26 @@ class MigrationRunner:
         """
         started = time.monotonic()
         try:
+            if not self._migration_still_needed(task):
+                duration = time.monotonic() - started
+                LOG.info(
+                    "Migration %s no-op: instance already on %s",
+                    task.task_id[:8],
+                    task.to_host,
+                )
+                return MigrationResult(
+                    task_id=task.task_id,
+                    plan_id=task.plan_id,
+                    aggregate=task.aggregate,
+                    instance_uuid=task.instance_uuid,
+                    from_host=task.from_host,
+                    to_host=task.to_host,
+                    success=True,
+                    duration_seconds=duration,
+                    retry_count=task.retry_count,
+                    completed_at=datetime.now(tz=UTC).isoformat(),
+                )
+
             self._pre_flight(task)
             self._nova.live_migrate(task.instance_uuid, task.to_host)
             self._poll_until_complete(task)
@@ -95,6 +117,18 @@ class MigrationRunner:
                 retry_count=task.retry_count,
                 completed_at=datetime.now(tz=UTC).isoformat(),
             )
+
+    def _migration_still_needed(self, task: MigrationTask) -> bool:
+        """Return False if the instance is already on the destination host.
+
+        The engine may dispatch a task that became a no-op between
+        planning and execution: e.g. an earlier attempt's live-migrate
+        completed after a post-flight race (Nova live-migrate is async),
+        or an operator moved the VM out of band.  Either way the work
+        is done; skip pre-flight and report success rather than retrying
+        and quarantining a healthy instance.
+        """
+        return self._nova.get_instance_host(task.instance_uuid) != task.to_host
 
     def _pre_flight(self, task: MigrationTask) -> None:
         """Validate the instance and host are in a migratable state.
@@ -183,34 +217,53 @@ class MigrationRunner:
             )
 
     def _poll_until_complete(self, task: MigrationTask) -> None:
-        """Poll Nova until the migration reaches a terminal state or times out."""
+        """Poll Nova until the migration reaches a terminal state or times out.
+
+        ``GET /servers/{id}/migrations`` only lists *active* migrations, so
+        ``None`` is ambiguous: either the migration record has not been
+        materialized yet (Nova's live-migrate API is async / 202), or it
+        completed and was removed.  Disambiguate by checking the
+        instance's current host.  A premature ``None`` immediately after
+        ``live_migrate`` was previously read as completion, causing
+        post-flight to race the conductor and fail.
+        """
         deadline = time.monotonic() + self._timeout
+        seen_active = False
 
         while time.monotonic() < deadline:
             status = self._nova.get_migration_status(task.instance_uuid)
 
             if status is None:
-                # No active migration - it either completed and disappeared,
-                # or was never started. Check post-flight to determine.
+                if self._nova.get_instance_host(task.instance_uuid) == task.to_host:
+                    return
+                if seen_active:
+                    raise MigrationFailed(
+                        instance_uuid=task.instance_uuid,
+                        from_host=task.from_host,
+                        to_host=task.to_host,
+                        reason=(
+                            "Migration disappeared from Nova's active list "
+                            "without arriving at destination."
+                        ),
+                    )
+            elif status.is_success:
                 return
-
-            if status.is_success:
-                return
-
-            if status.is_terminal:
+            elif status.is_terminal:
                 raise MigrationFailed(
                     instance_uuid=task.instance_uuid,
                     from_host=task.from_host,
                     to_host=task.to_host,
                     reason=f"Nova reports migration status: {status.value}",
                 )
+            else:
+                seen_active = True
+                LOG.debug(
+                    "Migration %s: status=%s, polling again in %ds",
+                    task.task_id[:8],
+                    status.value,
+                    self._poll_interval,
+                )
 
-            LOG.debug(
-                "Migration %s: status=%s, polling again in %ds",
-                task.task_id[:8],
-                status.value,
-                self._poll_interval,
-            )
             time.sleep(self._poll_interval)
 
         raise MigrationTimeout(

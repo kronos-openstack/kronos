@@ -90,16 +90,16 @@ class TestPreFlight:
 class TestExecuteSuccess:
     def test_full_lifecycle(self, runner: tuple[MigrationRunner, MagicMock]) -> None:
         r, nova = runner
-        # Pre-flight
         nova.get_instance_status.side_effect = [
             ("ACTIVE", None),   # pre-flight
             ("ACTIVE", None),   # post-flight
         ]
         nova.get_instance_host.side_effect = [
+            "host-a",  # _migration_still_needed
             "host-a",  # pre-flight
+            "host-b",  # _poll_until_complete (status=None disambiguation)
             "host-b",  # post-flight
         ]
-        # Poll: migration gone (completed)
         nova.get_migration_status.return_value = None
 
         result = r.execute(_make_task())
@@ -115,7 +115,9 @@ class TestExecuteSuccess:
             ("ACTIVE", None),   # post-flight
         ]
         nova.get_instance_host.side_effect = [
+            "host-a",  # _migration_still_needed
             "host-a",  # pre-flight
+            "host-b",  # _poll_until_complete (status=None disambiguation)
             "host-b",  # post-flight
         ]
         # Poll: running, running, then gone
@@ -130,6 +132,25 @@ class TestExecuteSuccess:
 
         assert result.success
         assert nova.get_migration_status.call_count == 3
+
+    def test_already_at_destination_is_noop(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Instance already on to_host short-circuits without calling live_migrate.
+
+        Covers the post-flight race fix: the engine may dispatch a task that
+        completed between planning and execution, or a duplicate after a
+        retry; either way the work is done and re-issuing live_migrate would
+        be a no-op or an error.
+        """
+        r, nova = runner
+        nova.get_instance_host.return_value = "host-b"
+
+        result = r.execute(_make_task())
+
+        assert result.success
+        nova.live_migrate.assert_not_called()
+        nova.get_instance_status.assert_not_called()
 
 
 class TestExecuteFailure:
@@ -157,22 +178,33 @@ class TestExecuteFailure:
         assert not result.success
         assert "timed out" in result.error.lower() or "timeout" in result.error.lower()
 
-    def test_post_flight_wrong_host(self, runner: tuple[MigrationRunner, MagicMock]) -> None:
-        r, nova = runner
-        nova.get_instance_status.side_effect = [
-            ("ACTIVE", None),   # pre-flight
-            ("ACTIVE", None),   # post-flight
-        ]
-        nova.get_instance_host.side_effect = [
-            "host-a",  # pre-flight
-            "host-a",  # post-flight - still on source!
-        ]
-        nova.get_migration_status.return_value = None
+    def test_migration_disappeared_without_arriving(
+        self, runner: tuple[MigrationRunner, MagicMock],
+    ) -> None:
+        """Active migration vanishes from Nova's list but instance is still on source.
 
-        result = r.execute(_make_task())
+        Distinguishes a true disappearance (Nova dropped the migration record
+        after a failure) from the pending case (record not yet materialized
+        immediately after live_migrate).  The poll loop only treats this as a
+        failure once it has seen the migration in an active state at least once.
+        """
+        r, nova = runner
+        nova.get_instance_status.return_value = ("ACTIVE", None)
+        nova.get_instance_host.side_effect = [
+            "host-a",  # _migration_still_needed
+            "host-a",  # pre-flight
+            "host-a",  # _poll_until_complete (status=None, still on source)
+        ]
+        nova.get_migration_status.side_effect = [
+            MigrationStatus.RUNNING,
+            None,
+        ]
+
+        with patch("kronos.executor.migrate.time.sleep"):
+            result = r.execute(_make_task())
 
         assert not result.success
-        assert "host-a" in result.error
+        assert "disappeared" in result.error.lower()
 
     def test_post_flight_not_active(self, runner: tuple[MigrationRunner, MagicMock]) -> None:
         r, nova = runner
@@ -181,7 +213,9 @@ class TestExecuteFailure:
             ("ERROR", None),    # post-flight
         ]
         nova.get_instance_host.side_effect = [
+            "host-a",  # _migration_still_needed
             "host-a",  # pre-flight
+            "host-b",  # _poll_until_complete (status=None disambiguation)
             "host-b",  # post-flight - right host but wrong status
         ]
         nova.get_migration_status.return_value = None
@@ -324,7 +358,9 @@ class TestPreFlightServiceState:
             ("ACTIVE", None),  # post-flight
         ]
         nova.get_instance_host.side_effect = [
+            "host-a",  # _migration_still_needed
             "host-a",  # pre-flight
+            "host-b",  # _poll_until_complete (status=None disambiguation)
             "host-b",  # post-flight
         ]
         nova.get_migration_status.return_value = None

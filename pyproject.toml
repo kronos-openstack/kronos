@@ -76,6 +76,7 @@ module = [
     "openstack.*",
     "pytimeparse2.*",
     "tenacity.*",
+    "eventlet.*",
 ]
 ignore_missing_imports = true
 follow_imports = "skip"
