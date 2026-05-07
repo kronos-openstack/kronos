@@ -133,6 +133,13 @@ availability_zone = nova
 aggregates = my-aggregate
 include_unassigned_hosts = false
 
+# Optional: on-demand snapshots. Send SIGUSR1 to the engine to dump
+# the current Nova + Prometheus state into a fresh subdirectory of
+# this folder, in the same format as `kronos-record`. Leave empty
+# to disable. When set, the directory is created at startup with a
+# writability probe; the engine refuses to start if either fails.
+# snapshot_dir = /tmp/kronos-snapshots
+
 # Cooldowns (seconds)
 cooldown = 600
 instance_cooldown = 900
@@ -247,14 +254,20 @@ kronos-executor --config-file /etc/kronos/kronos.conf --unassigned
 
 ### Record & Replay (offline testing)
 
-Capture a snapshot of live OpenStack + Prometheus state and replay it locally:
+Capture a snapshot of live OpenStack + Prometheus state and replay it locally.
+Both `kronos-record` and the engine's SIGUSR1 handler use the same writer, so
+every snapshot lands in a fresh `kronos-engine-snapshot-<UTC>` subdirectory.
 
 ```bash
-# Record
-kronos-record --config-file /etc/kronos/kronos.conf /tmp/snapshot
+# Record into /tmp/snapshots/, watch the printed subdir path
+kronos-record --config-file /etc/kronos/kronos.conf /tmp/snapshots
 
-# Replay a single engine cycle against recorded data
-kronos-replay --config-file /etc/kronos/kronos.conf /tmp/snapshot
+# Or, send SIGUSR1 to a running engine (snapshot_dir must be set)
+kill -USR1 $(pgrep -f kronos-engine)
+
+# Replay a single engine cycle against the snapshot subdirectory
+kronos-replay --config-file /etc/kronos/kronos.conf \
+    /tmp/snapshots/kronos-engine-snapshot-20260507T200000Z
 ```
 
 ## Policy Modes

@@ -17,6 +17,14 @@
 # Deploy one engine per AZ. Default 'nova' matches the Nova default zone.
 # availability_zone = nova
 
+# On-demand snapshots: when set, sending SIGUSR1 to the engine writes a
+# full Nova + Prometheus snapshot under this directory in the same format
+# as kronos-record (one fresh 'kronos-engine-snapshot-<UTC>' subdirectory
+# per signal). The directory is created at startup with a writability
+# probe; the engine refuses to start if either step fails. Leave empty
+# to disable.
+# snapshot_dir =
+
 # When true, plan migrations to evacuate VMs off compute hosts whose
 # nova-compute service is administratively disabled (status=disabled).
 # Evacuation runs before the affinity enforcer and the imbalance

@@ -112,6 +112,7 @@ def mock_engine():
         conf.engine.aggregates = ["test-agg"]
         conf.engine.availability_zone = "nova"
         conf.engine.include_unassigned_hosts = False
+        conf.engine.snapshot_dir = ""
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
         conf.engine.evacuate_disabled_hosts = False
@@ -512,3 +513,90 @@ class TestStartLoop:
 
         assert mock_engine._running is False
         assert mock_engine._cycle_count == 1
+
+
+class TestSnapshotDirValidation:
+    def test_empty_dir_is_noop(self, mock_engine: EngineLoop) -> None:
+        mock_engine._conf.engine.snapshot_dir = ""
+        mock_engine._validate_snapshot_dir()  # must not raise
+
+    def test_creates_missing_dir_and_probes(
+        self, mock_engine: EngineLoop, tmp_path,
+    ) -> None:
+        target = tmp_path / "snaps" / "deeper"
+        mock_engine._conf.engine.snapshot_dir = str(target)
+        mock_engine._validate_snapshot_dir()
+        assert target.is_dir()
+        # No probe subdir should remain after validation.
+        assert list(target.iterdir()) == []
+
+    def test_existing_writable_dir_passes(
+        self, mock_engine: EngineLoop, tmp_path,
+    ) -> None:
+        mock_engine._conf.engine.snapshot_dir = str(tmp_path)
+        mock_engine._validate_snapshot_dir()
+
+    def test_unwritable_dir_crashes(
+        self, mock_engine: EngineLoop, tmp_path,
+    ) -> None:
+        ro = tmp_path / "ro"
+        ro.mkdir(mode=0o555)
+        mock_engine._conf.engine.snapshot_dir = str(ro)
+        with pytest.raises(RuntimeError, match="not writable"):
+            mock_engine._validate_snapshot_dir()
+
+
+class TestEngineSnapshot:
+    def test_handle_snapshot_signal_sets_flag_and_wakeup(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        import signal as _signal
+        assert not mock_engine._snapshot_requested.is_set()
+        assert not mock_engine._wakeup.is_set()
+        mock_engine._handle_snapshot_signal(_signal.SIGUSR1, None)
+        assert mock_engine._snapshot_requested.is_set()
+        assert mock_engine._wakeup.is_set()
+
+    def test_write_snapshot_empty_dir_is_warning_noop(
+        self, mock_engine: EngineLoop, caplog,
+    ) -> None:
+        mock_engine._conf.engine.snapshot_dir = ""
+        with caplog.at_level("WARNING"):
+            mock_engine._write_engine_snapshot(
+                _make_policies_config(_make_policy()),
+                ["test-agg"],
+            )
+        assert any("snapshot_dir is empty" in r.message for r in caplog.records)
+
+    def test_write_snapshot_calls_writer(
+        self, mock_engine: EngineLoop, tmp_path,
+    ) -> None:
+        mock_engine._conf.engine.snapshot_dir = str(tmp_path)
+        with patch(
+            "kronos.engine.loop.write_snapshot",
+            return_value=tmp_path / "kronos-engine-snapshot-x",
+        ) as mock_writer:
+            mock_engine._write_engine_snapshot(
+                _make_policies_config(_make_policy()),
+                ["test-agg"],
+            )
+        mock_writer.assert_called_once()
+        called_parent = mock_writer.call_args.args[0]
+        assert called_parent == tmp_path
+
+    def test_write_snapshot_swallows_writer_errors(
+        self, mock_engine: EngineLoop, tmp_path, caplog,
+    ) -> None:
+        mock_engine._conf.engine.snapshot_dir = str(tmp_path)
+        with (
+            patch(
+                "kronos.engine.loop.write_snapshot",
+                side_effect=Exception("disk full"),
+            ),
+            caplog.at_level("ERROR"),
+        ):
+            mock_engine._write_engine_snapshot(
+                _make_policies_config(_make_policy()),
+                ["test-agg"],
+            )
+        assert any("Failed to write engine snapshot" in r.message for r in caplog.records)

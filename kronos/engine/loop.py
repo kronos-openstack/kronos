@@ -14,10 +14,12 @@ aggregate is evaluated independently every cycle:
 from __future__ import annotations
 
 import signal
+import tempfile
 import threading
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from types import FrameType
 
 import oslo_messaging
@@ -35,6 +37,7 @@ from kronos.common.messaging import (
     results_topic,
     task_to_dict,
 )
+from kronos.common.snapshot import write_snapshot
 from kronos.engine._sim import combined_imbalance, group_vms_by_host
 from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
@@ -92,6 +95,10 @@ class EngineLoop:
         # unblocks the wait immediately.
         self._wakeup = threading.Event()
 
+        # SIGUSR1 sets this; the main loop drains it between cycles
+        # and writes a snapshot to `[engine] snapshot_dir`.
+        self._snapshot_requested = threading.Event()
+
         # Messaging - only initialised when dry_run=False.
         # Keys: aggregate name, or None for the unassigned-hosts pool.
         self._rpc_clients: dict[str | None, oslo_messaging.RPCClient] = {}
@@ -114,30 +121,38 @@ class EngineLoop:
                 "or [engine] include_unassigned_hosts in kronos.conf.",
             )
 
+        self._validate_snapshot_dir()
+
         if not dry_run:
             self._init_messaging(aggregates)
 
         LOG.info(
             "Starting engine loop: interval=%ds, dry_run=%s, policies=%d, "
-            "availability_zone=%s, aggregates=%s",
+            "availability_zone=%s, aggregates=%s, snapshot_dir=%s",
             interval,
             dry_run,
             len(policies.policies),
             self._conf.engine.availability_zone,
             [a if a is not None else "<unassigned>" for a in aggregates],
+            self._conf.engine.snapshot_dir,
         )
 
         self._running = True
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGUSR1, self._handle_snapshot_signal)
 
         while self._running:
+            if self._snapshot_requested.is_set():
+                self._snapshot_requested.clear()
+                self._write_engine_snapshot(policies, aggregates)
+
             report = self._run_cycle(policies, aggregates, dry_run)
             self._log_report(report)
 
             if self._running:
                 # Interruptible inter-cycle sleep.  The signal handler
-                # sets `_wakeup` so SIGTERM/SIGINT exits within
+                # sets `_wakeup` so SIGTERM/SIGINT/SIGUSR1 exits within
                 # milliseconds instead of waiting the full interval.
                 self._wakeup.wait(timeout=interval)
                 self._wakeup.clear()
@@ -690,3 +705,91 @@ class EngineLoop:
         LOG.info("Received %s, shutting down gracefully...", sig_name)
         self._running = False
         self._wakeup.set()
+
+    def _handle_snapshot_signal(
+        self, signum: int, frame: FrameType | None,
+    ) -> None:
+        """SIGUSR1: queue a snapshot write for the next loop iteration.
+
+        We do no I/O from the signal handler itself; the main loop
+        drains the flag between cycles and writes the snapshot then.
+        Multiple SIGUSR1s coalesce into a single snapshot.
+        """
+        self._snapshot_requested.set()
+        self._wakeup.set()
+
+    def _validate_snapshot_dir(self) -> None:
+        """Create the snapshot dir at startup and prove we can write to it.
+
+        No-op when ``[engine] snapshot_dir`` is empty (snapshots are
+        disabled).  Otherwise:
+          1. ``mkdir -p`` the configured directory, and
+          2. create + remove a probe subdirectory inside it to prove
+             the engine can actually write child folders (mkdir alone
+             only proves the parent is writable).
+
+        If either step fails the engine refuses to start so operators
+        see the problem before the first SIGUSR1 arrives.
+        """
+        configured = self._conf.engine.snapshot_dir
+        if not configured:
+            return
+        snapshot_dir = Path(configured)
+        try:
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"[engine] snapshot_dir cannot be created: "
+                f"{snapshot_dir} ({exc})",
+            ) from exc
+        try:
+            probe = Path(
+                tempfile.mkdtemp(
+                    prefix="kronos-startup-probe-",
+                    dir=str(snapshot_dir),
+                ),
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"[engine] snapshot_dir is not writable: "
+                f"{snapshot_dir} ({exc})",
+            ) from exc
+        probe.rmdir()
+
+    def _write_engine_snapshot(
+        self,
+        policies: PoliciesConfig,
+        aggregates: list[str | None],
+    ) -> None:
+        """Write a snapshot under ``[engine] snapshot_dir``.
+
+        No-op when ``snapshot_dir`` is empty - SIGUSR1 still toggles
+        the flag, but we just log a warning and move on so the user
+        knows the signal arrived.
+
+        Other errors are caught and logged but do not stop the engine -
+        a failed snapshot must never take the planner down.
+        """
+        configured = self._conf.engine.snapshot_dir
+        if not configured:
+            LOG.warning(
+                "Received SIGUSR1 but [engine] snapshot_dir is empty; "
+                "snapshots are disabled.",
+            )
+            return
+
+        try:
+            target = write_snapshot(
+                Path(configured),
+                self._nova,
+                self._prometheus,
+                policies,
+                aggregates,
+            )
+            LOG.info("Engine snapshot written to %s", target)
+        except Exception:
+            LOG.error(
+                "Failed to write engine snapshot under %s",
+                configured,
+                exc_info=True,
+            )

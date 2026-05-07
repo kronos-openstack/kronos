@@ -181,6 +181,20 @@ engine_opts = [
             "be honoured."
         ),
     ),
+    cfg.StrOpt(
+        "snapshot_dir",
+        default="",
+        help=(
+            "Directory under which the engine writes on-demand snapshots "
+            "when it receives SIGUSR1. Each snapshot lands in a fresh "
+            "timestamped subdirectory in the same on-disk format as "
+            "kronos-record so it can be fed straight to kronos-replay. "
+            "Leave empty to disable: the engine will not write any "
+            "snapshot and will not touch the filesystem. When set, the "
+            "directory is created at startup (mkdir -p); the engine "
+            "refuses to start if creation fails."
+        ),
+    ),
     cfg.BoolOpt(
         "evacuate_disabled_hosts",
         default=False,

@@ -31,6 +31,16 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
   Deploy one engine per AZ, the same way you already deploy one
   executor per aggregate. There is no cross-AZ knob: cross-AZ live
   migration is never attempted.
+- **On-demand snapshots**: send `SIGUSR1` to the engine to capture a
+  full Nova + Prometheus snapshot under `[engine] snapshot_dir`
+  (default empty, which disables the feature). When set, the
+  directory is created at startup with a writability probe; the
+  engine refuses to start if either step fails. Each snapshot lands
+  in a fresh `kronos-engine-snapshot-<UTC>` subfolder in the same
+  on-disk format as `kronos-record`, so it can be fed straight to
+  `kronos-replay`. Both the CLI and the engine call
+  `kronos.common.snapshot.write_snapshot()` so the format stays in
+  lockstep.
 - **Host liveness gate**: every cycle the engine fetches Nova
   `os-services` once and installs the result on the constraint
   checker. Only hosts whose `nova-compute` service is `state=up` and
