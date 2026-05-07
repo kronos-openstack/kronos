@@ -118,10 +118,12 @@ class EngineLoop:
             self._init_messaging(aggregates)
 
         LOG.info(
-            "Starting engine loop: interval=%ds, dry_run=%s, policies=%d, aggregates=%s",
+            "Starting engine loop: interval=%ds, dry_run=%s, policies=%d, "
+            "availability_zone=%s, aggregates=%s",
             interval,
             dry_run,
             len(policies.policies),
+            self._conf.engine.availability_zone,
             [a if a is not None else "<unassigned>" for a in aggregates],
         )
 
@@ -182,6 +184,43 @@ class EngineLoop:
                 "Result listeners did not drain within 10s; "
                 "exiting anyway.",
             )
+
+    def _filter_hosts_to_az(
+        self,
+        hosts: list[str],
+        services: dict[str, ComputeService],
+        aggregate_name: str,
+    ) -> list[str]:
+        """Drop hosts that are not in the engine's configured AZ.
+
+        The engine is scoped to a single availability zone (``[engine]
+        availability_zone``). Hosts whose nova-compute service reports
+        a different zone (or no zone at all) are excluded so migrations
+        cannot cross AZ boundaries by construction.
+        """
+        az = self._conf.engine.availability_zone
+        az_hosts: list[str] = []
+        for host in hosts:
+            svc = services.get(host)
+            if svc is None:
+                continue
+            if svc.zone != az:
+                LOG.debug(
+                    "Aggregate '%s': dropped host %s outside AZ '%s'",
+                    aggregate_name,
+                    host,
+                    az,
+                )
+                continue
+            az_hosts.append(host)
+
+        if not az_hosts:
+            LOG.warning(
+                "Aggregate '%s' has no hosts in AZ '%s', skipping.",
+                aggregate_name,
+                az,
+            )
+        return az_hosts
 
     def _drop_vms_on_unreachable_hosts(
         self,
@@ -379,6 +418,10 @@ class EngineLoop:
 
         if not hosts:
             LOG.info("Aggregate '%s' has no hosts, skipping.", name)
+            return result
+
+        hosts = self._filter_hosts_to_az(hosts, services, name)
+        if not hosts:
             return result
 
         # Score every policy in turn

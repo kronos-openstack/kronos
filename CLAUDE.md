@@ -23,11 +23,14 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
 - **Aggregate boundaries**: migrations stay within an aggregate. The
   unassigned pool is its own scope - migrations never cross between it
   and a named aggregate.
-- **AZ awareness** (planned): the planner discovers each
-  hypervisor's availability zone and surfaces it in logs and cycle
-  reports. Cross-AZ migrations are allowed by default; an opt-in
-  `[engine] restrict_to_az` flag makes the planner refuse moves
-  whose source and destination AZs differ.
+- **AZ scope**: each engine is bound to exactly one Nova
+  availability zone via `[engine] availability_zone` (default
+  `nova`). Hosts whose `nova-compute` service reports a different
+  zone (or no zone at all) are filtered out of every aggregate
+  scope, so migrations cannot cross AZ boundaries by construction.
+  Deploy one engine per AZ, the same way you already deploy one
+  executor per aggregate. There is no cross-AZ knob: cross-AZ live
+  migration is never attempted.
 - **Host liveness gate**: every cycle the engine fetches Nova
   `os-services` once and installs the result on the constraint
   checker. Only hosts whose `nova-compute` service is `state=up` and
@@ -97,15 +100,22 @@ call `logging.getLogger(__name__)`.
 - `kronos-replay` → `kronos.cmd.replay:main` - run engine pipeline offline against a snapshot
 
 ## Engine Scope
-The engine operates on a fixed set of aggregates defined at startup:
+The engine is bound to one Nova availability zone and operates on
+a fixed set of aggregates within it, defined at startup:
 
 ```ini
 [engine]
+availability_zone = nova
 aggregates = gpu-aggregate, hpc-aggregate
 include_unassigned_hosts = false
 ```
 
 Semantics:
+- `availability_zone` - the Nova AZ this engine manages. Hosts whose
+  nova-compute service reports a different zone (or no zone) are
+  dropped from every aggregate scope, so migrations stay within this
+  AZ by construction. Default `nova` matches the Nova default zone.
+  Deploy one engine per AZ.
 - `aggregates` - comma-separated Nova host aggregate names
 - `include_unassigned_hosts` - when true, also plan the pool of
   compute hypervisors that belong to no aggregate (common in small
@@ -209,9 +219,11 @@ decisions. Retry logic lives in the client, not the caller.
 - **`list_compute_services()`**: returns `ComputeService` dataclasses
   for every `nova-compute` entry in `os-services`. Each has `host`,
   `binary`, `state` (`up`/`down`), `status` (`enabled`/`disabled`),
-  `disabled_reason`, `forced_down`. The helper
-  `is_available_destination` is True only when up + enabled and not
-  forced down. Other binaries (conductor/scheduler) are filtered out.
+  `zone` (the host's availability zone, empty string if Nova reports
+  none - logged as a warning), `disabled_reason`, `forced_down`. The
+  helper `is_available_destination` is True only when up + enabled
+  and not forced down. Other binaries (conductor/scheduler) are
+  filtered out.
 - **Server group compatibility**: reads both legacy `policy` (singular
   string) and modern `policies` (list) and merges them. Older Nova
   deployments populate only the singular field.

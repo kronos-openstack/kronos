@@ -73,6 +73,7 @@ class ComputeService:
     binary: str
     state: str
     status: str
+    zone: str = ""
     disabled_reason: str = ""
     forced_down: bool = False
 
@@ -295,12 +296,22 @@ class NovaClient:
         for s in services:
             if getattr(s, "binary", "") != "nova-compute":
                 continue
+            host = getattr(s, "host", "") or ""
+            zone = str(getattr(s, "availability_zone", "") or "")
+            if not zone:
+                LOG.warning(
+                    "nova-compute host '%s' has no availability_zone; "
+                    "treating as unconfigured (will not match any "
+                    "AZ-scoped engine).",
+                    host,
+                )
             result.append(
                 ComputeService(
-                    host=getattr(s, "host", "") or "",
+                    host=host,
                     binary=getattr(s, "binary", ""),
                     state=str(getattr(s, "state", "") or "").lower(),
                     status=str(getattr(s, "status", "") or "").lower(),
+                    zone=zone,
                     disabled_reason=str(getattr(s, "disabled_reason", "") or ""),
                     forced_down=bool(getattr(s, "forced_down", False)),
                 ),

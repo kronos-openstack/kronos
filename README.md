@@ -67,12 +67,16 @@ them out through the Nova live-migrate API.
    that are `state=up` and `status=enabled` (and not `forced_down`) are
    accepted as live-migration destinations. VMs whose source host is
    down or missing from Nova's view drop out of the candidate set.
-9. **Evacuator** (optional) drains VMs off hosts whose nova-compute
-   service is `status=disabled`. Enable per engine via
-   `[engine] evacuate_disabled_hosts`. Evacuation runs before the
-   affinity enforcer and the imbalance planner and shares the same
-   `max_migrations_per_cycle` budget.
-10. **Executor** consumes migration tasks, validates pre-flight state,
+9. **AZ scope**: each engine is bound to one Nova availability zone
+   via `[engine] availability_zone` (default `nova`). Hosts in any
+   other zone are filtered out of every aggregate scope, so cross-AZ
+   migrations cannot occur. Deploy one engine per AZ.
+10. **Evacuator** (optional) drains VMs off hosts whose nova-compute
+    service is `status=disabled`. Enable per engine via
+    `[engine] evacuate_disabled_hosts`. Evacuation runs before the
+    affinity enforcer and the imbalance planner and shares the same
+    `max_migrations_per_cycle` budget.
+11. **Executor** consumes migration tasks, validates pre-flight state,
     re-checks service state for source and destination, calls Nova
     live-migrate, polls until completion, and verifies post-flight.
 
@@ -117,6 +121,12 @@ sudo cp etc/kronos/policies.yaml.sample /etc/kronos/policies.yaml
 evaluation_interval = 60
 dry_run = true
 policies_file = /etc/kronos/policies.yaml
+
+# AZ scope: this engine manages exactly one availability zone.
+# Hosts whose nova-compute service reports a different AZ are
+# filtered out of every aggregate scope - migrations cannot cross
+# AZ boundaries. Deploy one engine per AZ.
+availability_zone = nova
 
 # Aggregate scope: at least one of `aggregates` or
 # `include_unassigned_hosts = true` must be set.
@@ -261,29 +271,32 @@ aggregate boundaries.
 
 ### Engine (planner)
 
-One engine owns a set of aggregates (or the unassigned-hosts pool) and
-evaluates all enabled policies against each aggregate every cycle:
+One engine is bound to one availability zone (`[engine] availability_zone`)
+and owns a set of aggregates within it (or the unassigned-hosts pool).
+It evaluates all enabled policies against each aggregate every cycle:
 
-1. **Score** - each policy runs its PromQL imbalance query; values must be in [0, 1]
-2. **Profile** - collect per-VM resource weights *across all policies* in one pass
-3. **Host liveness** - fetch nova-compute service state once per cycle. Only
+1. **AZ filter** - drop hosts whose nova-compute service reports a
+   different zone (or none). Migrations cannot cross AZ boundaries.
+2. **Score** - each policy runs its PromQL imbalance query; values must be in [0, 1]
+3. **Profile** - collect per-VM resource weights *across all policies* in one pass
+4. **Host liveness** - fetch nova-compute service state once per cycle. Only
    hosts that are `state=up` and `status=enabled` (and not `forced_down`)
    are accepted as live-migration destinations; VMs whose source host is
    `state=down` are dropped from the candidate set.
-4. **Constrain** - reject any move that would break a Nova server-group placement rule
-5. **Evacuate** (optional) - when `evacuate_disabled_hosts` is set,
+5. **Constrain** - reject any move that would break a Nova server-group placement rule
+6. **Evacuate** (optional) - when `evacuate_disabled_hosts` is set,
    propose moves for VMs sitting on hosts whose nova-compute service is
    `status=disabled`. Runs before the affinity enforcer.
-6. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
+7. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
    propose repair moves for VMs already violating their groups
-7. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
+8. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
    per-cycle migration budget with the evacuator and enforcer
-8. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
+9. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
    task carries a `phase` field (`evacuate`, `affinity`, `spread`, or `pack`) that
    surfaces in logs so operators can see why each migration was proposed
-9. **Cooldown** - record aggregate-level and instance-level cooldown on plan
-   emission; skip VMs already in cooldown or quarantine on the next cycle
-10. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
+10. **Cooldown** - record aggregate-level and instance-level cooldown on plan
+    emission; skip VMs already in cooldown or quarantine on the next cycle
+11. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
     VMs on a definitive failure (PreFlightError, MigrationFailed,
     MigrationTimeout) so the planner stops re-proposing them. Transient
     NovaClientError failures are not quarantined; the normal instance
@@ -369,7 +382,7 @@ enforcer, planner) so you can see where cycles are spent.
 | **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
 | **M4** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
 | **M5** | Pre-migration host: nova-compute service liveness on source and destination, evacuator for admin-disabled hosts. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly. | Done |
-| **M6** | AZ awareness: discover Nova availability zones, surface them in logs and cycle reports, optionally restrict migrations to within an AZ (configurable, cross-AZ not allowed by default) | Planned |
+| **M6** | AZ scope: the engine is bound to one availability zone (`[engine] availability_zone`, default `nova`); hosts in any other zone are filtered out of every aggregate. Cross-AZ migrations cannot occur. Deploy one engine per AZ. | Done |
 | **M7** | Audit logging (append-only JSONL) and general logging cleanup: no leading whitespace, no multiline LOG calls, single format string per call (OpenStack-standard oslo.log style) | Planned |
 | **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Planned |
 | **M9** | PyPI packaging, container image, systemd units, documentation | Planned |

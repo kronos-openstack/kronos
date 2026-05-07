@@ -273,6 +273,7 @@ def _make_mock_service(
     binary="nova-compute",
     state="up",
     status="enabled",
+    availability_zone="nova",
     disabled_reason="",
     forced_down=False,
 ):
@@ -281,6 +282,7 @@ def _make_mock_service(
     svc.binary = binary
     svc.state = state
     svc.status = status
+    svc.availability_zone = availability_zone
     svc.disabled_reason = disabled_reason
     svc.forced_down = forced_down
     return svc
@@ -342,6 +344,32 @@ class TestListComputeServices:
         result = mock_nova_client.list_compute_services()
         assert result[0].forced_down is True
         assert result[0].is_available_destination is False
+
+    def test_zone_parsed_from_availability_zone(self, mock_nova_client):
+        services = [
+            _make_mock_service(host="h1", availability_zone="nova"),
+            _make_mock_service(host="h2", availability_zone="dmz"),
+        ]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        result = mock_nova_client.list_compute_services()
+        zones = {s.host: s.zone for s in result}
+        assert zones == {"h1": "nova", "h2": "dmz"}
+
+    def test_missing_zone_warns_and_stays_empty(
+        self, mock_nova_client, caplog,
+    ):
+        services = [_make_mock_service(host="h1", availability_zone="")]
+        mock_nova_client._mock_conn.compute.services.return_value = services
+
+        with caplog.at_level("WARNING"):
+            result = mock_nova_client.list_compute_services()
+
+        assert result[0].zone == ""
+        assert any(
+            "h1" in r.message and "availability_zone" in r.message
+            for r in caplog.records
+        )
 
     def test_disabled_reason_carried_through(self, mock_nova_client):
         services = [

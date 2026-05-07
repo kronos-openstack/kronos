@@ -120,13 +120,26 @@ engine_opts = [
             "plan can be emitted for the same aggregate."
         ),
     ),
+    cfg.StrOpt(
+        "availability_zone",
+        default="nova",
+        help=(
+            "Nova availability zone this engine manages. Hosts whose "
+            "nova-compute service reports a different AZ (or no AZ) are "
+            "filtered out of every scope, so migrations stay within this "
+            "AZ by construction. Deploy one engine per AZ. Default 'nova' "
+            "matches the Nova default zone for hosts in no AZ-tagged "
+            "aggregate."
+        ),
+    ),
     cfg.ListOpt(
         "aggregates",
         default=[],
         help=(
             "Nova host aggregate names this engine manages. Each listed "
             "aggregate is planned independently; migrations stay within "
-            "aggregate boundaries."
+            "aggregate boundaries. Hosts outside the engine's "
+            "availability_zone are filtered out."
         ),
     ),
     cfg.BoolOpt(

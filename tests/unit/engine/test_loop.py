@@ -27,12 +27,14 @@ def _make_compute_service(
     host: str,
     state: str = "up",
     status: str = "enabled",
+    zone: str = "nova",
 ) -> ComputeService:
     return ComputeService(
         host=host,
         binary="nova-compute",
         state=state,
         status=status,
+        zone=zone,
     )
 
 
@@ -108,6 +110,7 @@ def mock_engine():
         conf.engine.instance_cooldown = 900
         conf.engine.cooldown = 600
         conf.engine.aggregates = ["test-agg"]
+        conf.engine.availability_zone = "nova"
         conf.engine.include_unassigned_hosts = False
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
@@ -318,6 +321,42 @@ class TestEvaluateAggregate:
         mock_engine._profiler.collect.assert_called_once()
         mock_engine._planner.plan.assert_called_once()
         assert result.migration_plan is not None
+        assert result.imbalance_detected
+
+    def test_drops_hosts_outside_configured_az(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1", zone="other"),
+                "h2": _make_compute_service("h2", zone="other"),
+            },
+        )
+        assert result.aggregate == "test-agg"
+        mock_engine._profiler.collect.assert_not_called()
+        mock_engine._planner.plan.assert_not_called()
+
+    def test_keeps_hosts_in_configured_az(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
+        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
+        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+        mock_engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2", "h3"]
+
+        result = mock_engine._evaluate_aggregate(
+            "test-agg", [_make_policy()], dry_run=True,
+            services={
+                "h1": _make_compute_service("h1", zone="nova"),
+                "h2": _make_compute_service("h2", zone="other"),
+                "h3": _make_compute_service("h3", zone="nova"),
+            },
+        )
+
+        called_hosts = mock_engine._scorer.evaluate.call_args_list[0].args[1]
+        assert called_hosts == ["h1", "h3"]
         assert result.imbalance_detected
 
     def test_no_vm_profiles_skips_planner(self, mock_engine: EngineLoop) -> None:

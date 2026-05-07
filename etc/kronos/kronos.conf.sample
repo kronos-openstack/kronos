@@ -11,6 +11,12 @@
 # Path to the policies YAML file.
 # policies_file = /etc/kronos/policies.yaml
 
+# Nova availability zone this engine manages. Hosts whose nova-compute
+# service reports a different AZ (or no AZ) are filtered out of every
+# aggregate scope, so migrations stay within this AZ by construction.
+# Deploy one engine per AZ. Default 'nova' matches the Nova default zone.
+# availability_zone = nova
+
 # When true, plan migrations to evacuate VMs off compute hosts whose
 # nova-compute service is administratively disabled (status=disabled).
 # Evacuation runs before the affinity enforcer and the imbalance
