@@ -122,8 +122,20 @@ class VmProfiler:
 
     def _collect_instances(self, hosts: list[str]) -> list[Instance]:
         instances: list[Instance] = []
+        skipped: list[tuple[str, str]] = []
         for host in hosts:
-            instances.extend(self._nova.list_instances_on_host(host))
+            for inst in self._nova.list_instances_on_host(host):
+                if inst.status != "ACTIVE":
+                    skipped.append((inst.uuid, inst.status))
+                    continue
+                instances.append(inst)
+        if skipped:
+            LOG.debug(
+                "Skipped %d non-ACTIVE VM(s) (only ACTIVE instances are "
+                "live-migratable): %s",
+                len(skipped),
+                skipped,
+            )
         return instances
 
     def _query_vm_profiles(

@@ -39,6 +39,7 @@ def _make_instance(
     internal_name: str = "instance-00001",
     host: str = "h1",
     vcpus: int = 4,
+    status: str = "ACTIVE",
 ) -> Instance:
     return Instance(
         uuid=uuid,
@@ -47,7 +48,7 @@ def _make_instance(
         host=host,
         flavor_vcpus=vcpus,
         flavor_ram_mb=8192,
-        status="ACTIVE",
+        status=status,
     )
 
 
@@ -238,6 +239,29 @@ class TestVmProfilerCollect:
         assert profiles["u1"].sources["test-policy"] == "prometheus"
         assert profiles["u2"].sources["test-policy"] == "fallback:host_average"
         assert profiles["u2"].weights["test-policy"] == pytest.approx(0.4)
+
+    def test_skips_non_active_instances(
+        self, profiler: VmProfiler, mock_nova: MagicMock, mock_prometheus: MagicMock,
+    ) -> None:
+        instances = [
+            _make_instance(uuid="u1", internal_name="inst-001", host="h1", status="ACTIVE"),
+            _make_instance(uuid="u2", internal_name="inst-002", host="h1", status="SHUTOFF"),
+            _make_instance(uuid="u3", internal_name="inst-003", host="h1", status="ERROR"),
+            _make_instance(uuid="u4", internal_name="inst-004", host="h1", status="MIGRATING"),
+        ]
+        mock_nova.list_instances_on_host.return_value = instances
+        mock_prometheus.instant_query.return_value = _make_query_result(
+            {"inst-001": 0.5, "inst-002": 0.5, "inst-003": 0.5, "inst-004": 0.5},
+        )
+
+        policy = _make_policy()
+        profiles = profiler.collect(
+            policies=[policy],
+            hosts=["h1"],
+            host_scores_by_policy={policy.name: {"h1": 0.5}},
+        )
+
+        assert set(profiles.keys()) == {"u1"}
 
     def test_no_vm_profile_query(
         self, profiler: VmProfiler, mock_nova: MagicMock, mock_prometheus: MagicMock,
