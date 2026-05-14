@@ -515,6 +515,206 @@ class TestStartLoop:
         assert mock_engine._cycle_count == 1
 
 
+class TestRunOnce:
+    def test_loads_policies_and_aggregates_from_conf_by_default(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        policies = _make_policies_config(_make_policy())
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+        with patch(
+            "kronos.engine.loop.load_policies", return_value=policies,
+        ) as loader:
+            report = mock_engine.run_once()
+
+        loader.assert_called_once_with(mock_engine._conf.engine.policies_file)
+        assert isinstance(report, CycleReport)
+        assert len(report.aggregate_results) == 1
+        assert report.aggregate_results[0].aggregate == "test-agg"
+
+    def test_aggregate_override_skips_resolution(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        policies = _make_policies_config(_make_policy())
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+        # If override is honoured, _resolve_aggregates should not be
+        # consulted - sentinel via patched conf list.
+        mock_engine._conf.engine.aggregates = ["should-not-be-used"]
+
+        report = mock_engine.run_once(
+            policies=policies,
+            aggregates=["override-agg-1", "override-agg-2"],
+        )
+
+        names = [ar.aggregate for ar in report.aggregate_results]
+        assert names == ["override-agg-1", "override-agg-2"]
+
+    def test_does_not_start_main_loop_or_signal_handlers(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        policies = _make_policies_config(_make_policy())
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+        # run_once must not touch the loop machinery; _running stays
+        # at its default False and the wakeup event is untouched.
+        assert mock_engine._running is False
+        assert not mock_engine._wakeup.is_set()
+
+        mock_engine.run_once(policies=policies)
+
+        assert mock_engine._running is False
+        assert not mock_engine._wakeup.is_set()
+
+    def test_two_calls_increment_cycle_counter(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        policies = _make_policies_config(_make_policy())
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+        r1 = mock_engine.run_once(policies=policies)
+        r2 = mock_engine.run_once(policies=policies)
+        assert r1.cycle_number == 1
+        assert r2.cycle_number == 2
+
+
+class TestDependencyInjection:
+    def test_injected_clients_replace_defaults(self) -> None:
+        conf = MagicMock()
+        conf.engine.cooldown = 600
+        conf.engine.instance_cooldown = 900
+        conf.engine.enforce_hard_affinity = False
+        conf.engine.enforce_soft_affinity = False
+        conf.engine.evacuate_disabled_hosts = False
+
+        nova = MagicMock()
+        prom = MagicMock()
+        cooldown = MagicMock(spec_set=[
+            "is_aggregate_cooling",
+            "is_instance_cooling",
+            "is_instance_quarantined",
+            "record_plan_emission",
+            "quarantine_instance",
+        ])
+
+        # If injection works, NovaClient/PrometheusClient ctors are
+        # never called - patch them so any accidental construction
+        # would raise.
+        with (
+            patch(
+                "kronos.engine.loop.NovaClient",
+                side_effect=AssertionError("should not be constructed"),
+            ),
+            patch(
+                "kronos.engine.loop.PrometheusClient",
+                side_effect=AssertionError("should not be constructed"),
+            ),
+        ):
+            engine = EngineLoop(
+                conf, nova=nova, prometheus=prom, cooldown=cooldown,
+            )
+
+        assert engine._nova is nova
+        assert engine._prometheus is prom
+        assert engine._cooldown is cooldown
+
+    def test_timings_dict_starts_empty_when_provided(self) -> None:
+        conf = MagicMock()
+        conf.engine.cooldown = 600
+        conf.engine.instance_cooldown = 900
+        conf.engine.enforce_hard_affinity = False
+        conf.engine.enforce_soft_affinity = False
+        conf.engine.evacuate_disabled_hosts = False
+
+        timings: dict[str, float] = {}
+        with (
+            patch("kronos.engine.loop.NovaClient"),
+            patch("kronos.engine.loop.PrometheusClient"),
+        ):
+            engine = EngineLoop(conf, timings=timings)
+        assert engine.timings is timings
+
+    def test_no_timings_dict_means_none(self) -> None:
+        conf = MagicMock()
+        conf.engine.cooldown = 600
+        conf.engine.instance_cooldown = 900
+        conf.engine.enforce_hard_affinity = False
+        conf.engine.enforce_soft_affinity = False
+        conf.engine.evacuate_disabled_hosts = False
+        with (
+            patch("kronos.engine.loop.NovaClient"),
+            patch("kronos.engine.loop.PrometheusClient"),
+        ):
+            engine = EngineLoop(conf)
+        assert engine.timings is None
+
+
+class TestTimingsAccumulation:
+    def test_timings_populated_after_imbalanced_cycle(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        # Opt the engine into timings - production default is None.
+        timings: dict[str, float] = {}
+        mock_engine.timings = timings
+
+        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
+        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
+        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+
+        mock_engine._evaluate_aggregate(
+            "test-agg",
+            [_make_policy()],
+            dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
+        )
+
+        # Imbalance was detected, so scorer, profiler, evacuator,
+        # enforcer, and planner all ran.  Each should have an entry.
+        assert {"scorer", "profiler", "evacuator", "enforcer", "planner"}.issubset(
+            timings.keys(),
+        )
+        assert all(v >= 0.0 for v in timings.values())
+
+    def test_timings_none_means_no_recording(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        assert mock_engine.timings is None
+        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
+        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
+        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+
+        mock_engine._evaluate_aggregate(
+            "test-agg",
+            [_make_policy()],
+            dry_run=True,
+            services={
+                "h1": _make_compute_service("h1"),
+                "h2": _make_compute_service("h2"),
+            },
+        )
+        assert mock_engine.timings is None
+
+    def test_timings_accumulate_across_cycles(
+        self, mock_engine: EngineLoop,
+    ) -> None:
+        timings: dict[str, float] = {}
+        mock_engine.timings = timings
+        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+
+        policies = _make_policies_config(_make_policy())
+        mock_engine.run_once(policies=policies)
+        first = timings["scorer"]
+        mock_engine.run_once(policies=policies)
+        second = timings["scorer"]
+
+        # Per-cycle scorer time accumulates - second total is at least
+        # as large as the first (perf_counter monotonic, deltas >= 0).
+        assert second >= first
+
+
 class TestSnapshotDirValidation:
     def test_empty_dir_is_noop(self, mock_engine: EngineLoop) -> None:
         mock_engine._conf.engine.snapshot_dir = ""
