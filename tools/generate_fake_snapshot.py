@@ -60,6 +60,7 @@ def generate(
     group_size_mean: float,
     group_size_stdev: float,
     seed: int,
+    availability_zone: str = "nova",
 ) -> None:
     """Write a synthetic snapshot to ``out_dir``.
 
@@ -204,6 +205,7 @@ def generate(
             "binary": "nova-compute",
             "state": "up",
             "status": "enabled",
+            "zone": availability_zone,
             "disabled_reason": "",
             "forced_down": False,
         }
@@ -367,6 +369,16 @@ def _cli() -> argparse.Namespace:
     p.add_argument("--group-size-mean", type=float, default=4.0)
     p.add_argument("--group-size-stdev", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--availability-zone",
+        type=str,
+        default="nova",
+        help=(
+            "AZ stamped on every synthetic nova-compute service entry. "
+            "Must match [engine] availability_zone in the replay config "
+            "or the engine's AZ filter will drop every host."
+        ),
+    )
     return p.parse_args()
 
 
@@ -384,6 +396,7 @@ def main() -> int:
         group_size_mean=args.group_size_mean,
         group_size_stdev=args.group_size_stdev,
         seed=args.seed,
+        availability_zone=args.availability_zone,
     )
     print(f"Snapshot written to {args.out_dir}")
     return 0

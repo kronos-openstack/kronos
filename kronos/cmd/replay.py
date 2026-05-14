@@ -1,8 +1,13 @@
 """Entry point for ``kronos-replay``: run the engine against recorded data.
 
-Loads a snapshot directory produced by ``kronos-record`` and runs one
-combined-scoring evaluation per aggregate offline.  Nova and Prometheus
-clients are replaced with replay stubs backed by the snapshot files.
+Loads a snapshot directory produced by ``kronos-record`` (or by the
+engine's SIGUSR1 handler) and runs exactly one combined-scoring cycle
+offline.  The CLI is a thin wrapper: it builds replay-stub clients
+backed by the snapshot files, dependency-injects them into
+``EngineLoop``, and invokes the same ``run_once()`` the daemon's main
+loop calls every interval.  All evaluation, profiling, evacuation,
+affinity enforcement, planning, and logging code is shared with the
+production engine - there is no parallel pipeline here to drift.
 """
 
 from __future__ import annotations
@@ -21,16 +26,8 @@ from kronos.clients.prometheus import PrometheusHealth, QueryResult
 from kronos.common.config import register_opts
 from kronos.common.exceptions import AggregateNotFound
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
-from kronos.engine._sim import combined_imbalance, group_vms_by_host
-from kronos.engine.affinity_enforcer import AffinityEnforcer
-from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
-from kronos.engine.evacuator import Evacuator
-from kronos.engine.planner import Planner
-from kronos.engine.profiler import VmProfiler
-from kronos.engine.scorer import PolicyScorer
-from kronos.engine.types import MigrationPlan, VmProfile
-from kronos.policies.loader import load_policies
+from kronos.engine.loop import EngineLoop
 
 CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
@@ -39,7 +36,11 @@ LOG = logging.getLogger(__name__)
 class ReplayNovaClient:
     """Nova client stub that reads from a snapshot directory."""
 
-    def __init__(self, snapshot_dir: Path) -> None:
+    def __init__(
+        self,
+        snapshot_dir: Path,
+        default_zone: str = "nova",
+    ) -> None:
         nova_dir = snapshot_dir / "nova"
         self._aggregates: dict[str, list[str]] = json.loads(
             (nova_dir / "aggregates.json").read_text(),
@@ -55,7 +56,9 @@ class ReplayNovaClient:
         # with older snapshots that pre-date the host-liveness gate.
         # When the file is missing, synthesise an "all up + enabled"
         # map covering every host we know about so the replay still
-        # produces destinations.
+        # produces destinations.  ``default_zone`` is what the engine's
+        # AZ filter compares against; old snapshots without a ``zone``
+        # field default to it so the filter doesn't drop every host.
         services_path = nova_dir / "services.json"
         if services_path.exists():
             self._services: list[ComputeService] = [
@@ -64,6 +67,7 @@ class ReplayNovaClient:
                     binary=str(d.get("binary", "nova-compute")),
                     state=str(d.get("state", "up")),
                     status=str(d.get("status", "enabled")),
+                    zone=str(d.get("zone", default_zone)),
                     disabled_reason=str(d.get("disabled_reason", "")),
                     forced_down=bool(d.get("forced_down", False)),
                 )
@@ -79,9 +83,17 @@ class ReplayNovaClient:
                     binary="nova-compute",
                     state="up",
                     status="enabled",
+                    zone=default_zone,
                 )
                 for h in sorted(all_hosts)
             ]
+
+    def aggregate_keys(self) -> list[str | None]:
+        """Return the aggregate scope recorded in the snapshot."""
+        keys: list[str | None] = []
+        for key in self._aggregates:
+            keys.append(None if key == UNASSIGNED_TOPIC_MARKER else key)
+        return keys
 
     def get_hosts_in_aggregate(
         self, aggregate_name: str | None,
@@ -162,215 +174,6 @@ class ReplayPrometheusClient:
         )
 
 
-def _run_replay(
-    snapshot_dir: Path,
-    policies_file: str,
-    *,
-    enforce_hard: bool,
-    enforce_soft: bool,
-    evacuate_disabled: bool,
-    show_timings: bool,
-    cooldown: CooldownTracker,
-) -> int:
-    """Run a single engine cycle against snapshot data."""
-    nova = ReplayNovaClient(snapshot_dir)
-    prometheus = ReplayPrometheusClient(snapshot_dir)
-
-    scorer = PolicyScorer(prometheus)  # type: ignore[arg-type]
-    profiler = VmProfiler(prometheus, nova)  # type: ignore[arg-type]
-    constraints = ConstraintChecker(nova)  # type: ignore[arg-type]
-    enforcer = AffinityEnforcer(
-        constraints,
-        enforce_hard=enforce_hard,
-        enforce_soft=enforce_soft,
-    )
-    evacuator = Evacuator(constraints, enabled=evacuate_disabled)
-    planner = Planner(constraints)
-
-    services = {svc.host: svc for svc in nova.list_compute_services()}
-    constraints.set_services(services)
-
-    policies = load_policies(policies_file)
-    enabled = [p for p in policies.policies if p.enabled]
-
-    # Aggregates to iterate: mirror the snapshot's keys.
-    aggregates: list[str | None] = []
-    for key in nova._aggregates:
-        aggregates.append(None if key == UNASSIGNED_TOPIC_MARKER else key)
-
-    totals: dict[str, float] = {
-        "scorer": 0.0,
-        "profiler": 0.0,
-        "evacuator": 0.0,
-        "enforcer": 0.0,
-        "planner": 0.0,
-    }
-    cycle_start = time.perf_counter()
-
-    for aggregate in aggregates:
-        name = aggregate if aggregate is not None else "<unassigned>"
-        LOG.info("=== Aggregate: %s ===", name)
-
-        hosts = nova.get_hosts_in_aggregate(aggregate)
-        if not hosts:
-            LOG.info("No hosts recorded, skipping.")
-            continue
-
-        if cooldown.is_aggregate_cooling(name):
-            LOG.info("Aggregate '%s' is cooling, skipping planning.", name)
-            continue
-
-        t0 = time.perf_counter()
-        policy_results = [scorer.evaluate(p, hosts) for p in enabled]
-        totals["scorer"] += time.perf_counter() - t0
-
-        weighted_imbalance = 0.0
-        any_detected = False
-        for policy, pr in zip(enabled, policy_results, strict=True):
-            if pr.skipped:
-                LOG.info(
-                    "policy %s skipped (%s)",
-                    pr.policy_name, pr.skip_reason,
-                )
-                continue
-            weighted_imbalance += policy.weight * pr.imbalance
-            if pr.imbalance_detected:
-                any_detected = True
-            suffix = " (threshold exceeded)" if pr.imbalance_detected else ""
-            LOG.info(
-                "policy %s imbalance %.3f (threshold %.3f)%s",
-                pr.policy_name, pr.imbalance,
-                policy.threshold, suffix,
-            )
-
-        LOG.info("Combined imbalance: %.3f", weighted_imbalance)
-
-        if not any_detected and not enforcer.enabled and not evacuator.enabled:
-            continue
-
-        active = [
-            (p, pr) for p, pr in zip(enabled, policy_results, strict=True)
-            if not pr.skipped
-        ]
-        if not active:
-            LOG.info("No active policies, cannot plan.")
-            continue
-        active_policies = [p for p, _ in active]
-        active_results = [pr for _, pr in active]
-        host_scores_by_policy = {
-            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
-            for p, pr in active
-        }
-
-        t0 = time.perf_counter()
-        vm_profiles = profiler.collect(
-            policies=active_policies,
-            hosts=hosts,
-            host_scores_by_policy=host_scores_by_policy,
-        )
-        totals["profiler"] += time.perf_counter() - t0
-
-        vm_profiles = _filter_unavailable(vm_profiles, cooldown, name)
-
-        if not vm_profiles:
-            LOG.info("No VM profiles collected, cannot plan.")
-            continue
-
-        budget = max(p.max_migrations_per_cycle for p in active_policies)
-
-        scores = {
-            p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
-            for p, pr in active
-        }
-        vms_by_host = group_vms_by_host(vm_profiles)
-
-        plan = MigrationPlan(
-            aggregate=name,
-            policy_names=[p.name for p in active_policies],
-            initial_imbalance=combined_imbalance(scores, active_policies),
-        )
-
-        t0 = time.perf_counter()
-        evac_plan, scores, vms_by_host, remaining = evacuator.evacuate(
-            aggregate=name,
-            aggregate_hosts=hosts,
-            policies=active_policies,
-            scores=scores,
-            vms_by_host=vms_by_host,
-            vm_profiles=vm_profiles,
-            services=services,
-            budget=budget,
-        )
-        plan.steps.extend(evac_plan.steps)
-        totals["evacuator"] += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        enforce_plan, scores, vms_by_host, remaining = enforcer.enforce(
-            aggregate=name,
-            policies=active_policies,
-            policy_results=active_results,
-            vm_profiles=vm_profiles,
-            budget=remaining,
-            scores=scores,
-            vms_by_host=vms_by_host,
-        )
-        plan.steps.extend(enforce_plan.steps)
-        totals["enforcer"] += time.perf_counter() - t0
-
-        if any_detected:
-            t0 = time.perf_counter()
-            plan = planner.plan(
-                aggregate=name,
-                policies=active_policies,
-                policy_results=active_results,
-                vm_profiles=vm_profiles,
-                scores=scores,
-                vms_by_host=vms_by_host,
-                budget=remaining,
-                plan=plan,
-            )
-            totals["planner"] += time.perf_counter() - t0
-
-        plan.projected_imbalance = combined_imbalance(scores, active_policies)
-        _log_plan(plan)
-
-    if show_timings:
-        total = time.perf_counter() - cycle_start
-        LOG.info("--- Timings ---")
-        for phase, seconds in totals.items():
-            pct = (seconds / total * 100.0) if total else 0.0
-            LOG.info("%s %.3fs (%.1f%%)", phase, seconds, pct)
-        LOG.info("%s %.3fs (100.0%%)", "total", total)
-
-    return 0
-
-
-def _filter_unavailable(
-    vm_profiles: dict[str, VmProfile],
-    cooldown: CooldownTracker,
-    aggregate: str,
-) -> dict[str, VmProfile]:
-    """Drop VMs currently in instance cooldown or quarantine."""
-    kept: dict[str, VmProfile] = {}
-    skipped: list[str] = []
-    for instance_uuid, profile in vm_profiles.items():
-        if cooldown.is_instance_quarantined(instance_uuid):
-            skipped.append(f"{instance_uuid}=quarantined")
-            continue
-        if cooldown.is_instance_cooling(instance_uuid):
-            skipped.append(f"{instance_uuid}=cooling")
-            continue
-        kept[instance_uuid] = profile
-    if skipped:
-        LOG.info(
-            "Excluded %d VM(s) from planning in '%s': %s",
-            len(skipped),
-            aggregate,
-            ", ".join(skipped),
-        )
-    return kept
-
-
 def _load_cooldowns(
     snapshot_dir: Path,
     tracker: CooldownTracker,
@@ -414,28 +217,15 @@ def _load_cooldowns(
     )
 
 
-def _log_plan(plan: MigrationPlan) -> None:
-    if not plan.steps:
-        LOG.info("No migrations proposed.")
-        return
-
-    LOG.info(
-        "Plan: %d moves, combined imbalance %.3f -> %.3f (projected)",
-        plan.migration_count,
-        plan.initial_imbalance,
-        plan.projected_imbalance,
-    )
-    for i, step in enumerate(plan.steps, 1):
-        LOG.info(
-            "%d. %s %s (%s) %s -> %s, gain %.4f",
-            i,
-            step.phase.value,
-            step.instance_name,
-            step.instance_uuid[:8],
-            step.from_host,
-            step.to_host,
-            step.improvement,
-        )
+def _log_timings(timings: dict[str, float], total: float) -> None:
+    """Print per-phase wall-clock totals collected by the engine."""
+    LOG.info("--- Timings ---")
+    phases = ("scorer", "profiler", "evacuator", "enforcer", "planner")
+    for phase in phases:
+        seconds = timings.get(phase, 0.0)
+        pct = (seconds / total * 100.0) if total else 0.0
+        LOG.info("%s %.3fs (%.1f%%)", phase, seconds, pct)
+    LOG.info("total %.3fs (100.0%%)", total)
 
 
 def main() -> int:
@@ -456,7 +246,7 @@ def main() -> int:
             default=False,
             help=(
                 "Print per-phase wall-clock timings (scorer, profiler, "
-                "enforcer, planner) at the end of the cycle."
+                "evacuator, enforcer, planner) at the end of the cycle."
             ),
         ),
     )
@@ -483,18 +273,35 @@ def main() -> int:
             len(meta.get("policy_names", [])),
         )
 
+    nova = ReplayNovaClient(
+        snapshot_dir,
+        default_zone=CONF.engine.availability_zone,
+    )
+    prometheus = ReplayPrometheusClient(snapshot_dir)
+
     cooldown = CooldownTracker(
         aggregate_cooldown_seconds=float(CONF.engine.cooldown),
         instance_cooldown_seconds=float(CONF.engine.instance_cooldown),
     )
     _load_cooldowns(snapshot_dir, cooldown)
 
-    return _run_replay(
-        snapshot_dir,
-        CONF.engine.policies_file,
-        enforce_hard=CONF.engine.enforce_hard_affinity,
-        enforce_soft=CONF.engine.enforce_soft_affinity,
-        evacuate_disabled=CONF.engine.evacuate_disabled_hosts,
-        show_timings=CONF["time"],
+    timings: dict[str, float] | None = {} if CONF["time"] else None
+
+    engine = EngineLoop(
+        CONF,
+        nova=nova,  # type: ignore[arg-type]
+        prometheus=prometheus,  # type: ignore[arg-type]
         cooldown=cooldown,
+        timings=timings,
     )
+
+    started = time.perf_counter()
+    report = engine.run_once(aggregates=nova.aggregate_keys())
+    total = time.perf_counter() - started
+
+    engine._log_report(report)
+
+    if timings is not None:
+        _log_timings(timings, total)
+
+    return 0

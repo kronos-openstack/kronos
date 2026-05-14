@@ -64,10 +64,20 @@ LOG = logging.getLogger(__name__)
 class EngineLoop:
     """Periodic per-aggregate evaluation loop with combined scoring."""
 
-    def __init__(self, conf: cfg.ConfigOpts) -> None:
+    def __init__(
+        self,
+        conf: cfg.ConfigOpts,
+        *,
+        nova: NovaClient | None = None,
+        prometheus: PrometheusClient | None = None,
+        cooldown: CooldownTracker | None = None,
+        timings: dict[str, float] | None = None,
+    ) -> None:
         self._conf = conf
-        self._prometheus = PrometheusClient(conf)
-        self._nova = NovaClient(conf)
+        self._prometheus = (
+            prometheus if prometheus is not None else PrometheusClient(conf)
+        )
+        self._nova = nova if nova is not None else NovaClient(conf)
         self._scorer = PolicyScorer(self._prometheus)
         self._profiler = VmProfiler(self._prometheus, self._nova)
         self._constraints = ConstraintChecker(self._nova)
@@ -81,10 +91,19 @@ class EngineLoop:
             self._constraints,
             enabled=conf.engine.evacuate_disabled_hosts,
         )
-        self._cooldown = CooldownTracker(
-            aggregate_cooldown_seconds=float(conf.engine.cooldown),
-            instance_cooldown_seconds=float(conf.engine.instance_cooldown),
+        self._cooldown = (
+            cooldown if cooldown is not None
+            else CooldownTracker(
+                aggregate_cooldown_seconds=float(conf.engine.cooldown),
+                instance_cooldown_seconds=float(conf.engine.instance_cooldown),
+            )
         )
+        # Opt-in per-phase wall-clock accumulator.  When the caller
+        # passes a dict (typically ``{}``), `_evaluate_aggregate` adds
+        # per-phase seconds to it on every cycle.  ``None`` (the
+        # production default) skips the timer plumbing entirely.
+        self.timings: dict[str, float] | None = timings
+
         self._running = False
         self._cycle_count = 0
 
@@ -147,7 +166,7 @@ class EngineLoop:
                 self._snapshot_requested.clear()
                 self._write_engine_snapshot(policies, aggregates)
 
-            report = self._run_cycle(policies, aggregates, dry_run)
+            report = self.run_once(policies=policies, aggregates=aggregates)
             self._log_report(report)
 
             if self._running:
@@ -164,6 +183,45 @@ class EngineLoop:
         """Signal the loop to stop after the current cycle."""
         self._running = False
         self._wakeup.set()
+
+    def run_once(
+        self,
+        *,
+        policies: PoliciesConfig | None = None,
+        aggregates: list[str | None] | None = None,
+    ) -> CycleReport:
+        """Evaluate every aggregate once and return the cycle report.
+
+        Synchronous, single-cycle entry point used by ``kronos-replay``
+        and by tests that want the full engine pipeline without the
+        outer ``start()`` loop.  Does not initialise oslo.messaging,
+        install signal handlers, validate the snapshot directory, or
+        sleep between cycles - those concerns belong to ``start()``.
+
+        Both arguments are optional so production-style callers can
+        defer to oslo.config.  Replay overrides them because the
+        snapshot's aggregate set is authoritative for that run.
+        """
+        if policies is None:
+            policies = load_policies(self._conf.engine.policies_file)
+        if aggregates is None:
+            aggregates = self._resolve_aggregates()
+        return self._run_cycle(
+            policies, aggregates, self._conf.engine.dry_run,
+        )
+
+    def _time_phase(self, phase: str, start: float) -> None:
+        """Add ``perf_counter() - start`` to ``self.timings[phase]``.
+
+        No-op when timings are disabled (``self.timings is None``).
+        Centralising the conditional keeps `_evaluate_aggregate`
+        readable on the hot path.
+        """
+        if self.timings is None:
+            return
+        self.timings[phase] = (
+            self.timings.get(phase, 0.0) + (time.perf_counter() - start)
+        )
 
     def _shutdown_messaging(self) -> None:
         """Stop and drain the result listeners.
@@ -440,9 +498,11 @@ class EngineLoop:
             return result
 
         # Score every policy in turn
+        t0 = time.perf_counter()
         policy_results: list[PolicyResult] = [
             self._scorer.evaluate(policy, hosts) for policy in policies
         ]
+        self._time_phase("scorer", t0)
         result.policy_results = policy_results
 
         # Combined imbalance signal - weighted sum across all non-skipped policies
@@ -491,11 +551,13 @@ class EngineLoop:
             p.name: {hs.host: hs.raw_score for hs in pr.host_scores}
             for p, pr in zip(active_policies, active_results, strict=True)
         }
+        t0 = time.perf_counter()
         vm_profiles = self._profiler.collect(
             policies=active_policies,
             hosts=hosts,
             host_scores_by_policy=host_scores_by_policy,
         )
+        self._time_phase("profiler", t0)
         vm_profiles = self._drop_vms_on_unreachable_hosts(
             vm_profiles, hosts, services, name,
         )
@@ -522,6 +584,7 @@ class EngineLoop:
         # --- Evacuation pass (drain admin-disabled hosts) ---
         # Runs first so the affinity enforcer and the imbalance planner
         # see the post-evacuation simulated state.
+        t0 = time.perf_counter()
         evac_plan, scores, vms_by_host, remaining = self._evacuator.evacuate(
             aggregate=name,
             aggregate_hosts=hosts,
@@ -532,9 +595,11 @@ class EngineLoop:
             services=services,
             budget=budget,
         )
+        self._time_phase("evacuator", t0)
         plan.steps.extend(evac_plan.steps)
 
         # --- Affinity enforcement pass (repair existing violations) ---
+        t0 = time.perf_counter()
         enforce_plan, scores, vms_by_host, remaining = self._enforcer.enforce(
             aggregate=name,
             policies=active_policies,
@@ -544,6 +609,7 @@ class EngineLoop:
             scores=scores,
             vms_by_host=vms_by_host,
         )
+        self._time_phase("enforcer", t0)
         plan.steps.extend(enforce_plan.steps)
 
         # --- Imbalance pass (reduce PromQL-driven imbalance) ---
@@ -551,6 +617,7 @@ class EngineLoop:
         # The earlier passes may have left some imbalance behind; the
         # planner tackles it within ``remaining`` moves.
         if any_detected:
+            t0 = time.perf_counter()
             plan = self._planner.plan(
                 aggregate=name,
                 policies=active_policies,
@@ -561,6 +628,7 @@ class EngineLoop:
                 budget=remaining,
                 plan=plan,
             )
+            self._time_phase("planner", t0)
 
         plan.projected_imbalance = combined_imbalance(scores, active_policies)
         result.migration_plan = plan

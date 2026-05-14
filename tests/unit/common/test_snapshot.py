@@ -178,6 +178,37 @@ def test_section_failure_does_not_abort_snapshot(
     assert (target / "meta.json").exists()
 
 
+def test_services_round_trip_includes_zone(
+    tmp_path: Path, nova: MagicMock, prometheus: MagicMock,
+) -> None:
+    """Services written by the snapshot writer must carry the AZ.
+
+    Replay's host-AZ filter relies on this round-trip - without the
+    zone field, every host would be dropped from the engine's scope.
+    """
+    nova.list_compute_services.return_value = [
+        ComputeService(
+            host="h1", binary="nova-compute",
+            state="up", status="enabled", zone="gpu-az",
+        ),
+        ComputeService(
+            host="h2", binary="nova-compute",
+            state="up", status="enabled", zone="cpu-az",
+        ),
+    ]
+    target = write_snapshot(
+        tmp_path,
+        nova,
+        prometheus,
+        PoliciesConfig(policies=[_make_policy()]),
+        ["agg-a"],
+    )
+    services = json.loads((target / "nova" / "services.json").read_text())
+    by_host = {s["host"]: s for s in services}
+    assert by_host["h1"]["zone"] == "gpu-az"
+    assert by_host["h2"]["zone"] == "cpu-az"
+
+
 def test_returns_unique_subdirs_across_calls(
     tmp_path: Path, nova: MagicMock, prometheus: MagicMock,
 ) -> None:

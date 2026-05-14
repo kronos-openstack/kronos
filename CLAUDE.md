@@ -573,17 +573,40 @@ erroring.
 3. Initialise Prometheus client, Nova client, scorer, profiler, constraints, evacuator, enforcer, planner, cooldown
 4. If `dry_run=false`: create RPC transport + per-aggregate RPC clients, and a
    notification transport + per-aggregate result listeners
-5. Enter loop. Each cycle:
+5. Enter loop. Each cycle calls `run_once(policies, aggregates)`:
    - `invalidate_cache()` on the constraint checker.
    - Fetch nova-compute services once cluster-wide; install on the
      constraint checker (host-availability gate) and pass to the
      evacuator.  On failure, install an empty map - the gate fails
      closed and no migrations are emitted that cycle.
-   - For each aggregate → score → cooldown check → profile → drop
-     VMs whose source host is `state=down` → filter
-     quarantined/cooling VMs → evacuate disabled hosts → enforce
-     affinity → plan imbalance → cast → log.
+   - For each aggregate -> score -> cooldown check -> profile -> drop
+     VMs whose source host is `state=down` -> filter
+     quarantined/cooling VMs -> evacuate disabled hosts -> enforce
+     affinity -> plan imbalance -> cast -> log.
 6. Handle SIGTERM/SIGINT for graceful shutdown (drains result listeners)
+
+### Dependency injection and `run_once()`
+
+`EngineLoop.__init__` accepts optional `nova`, `prometheus`,
+`cooldown`, and `timings` keyword arguments.  Production callers
+(`kronos-engine`) leave them at `None` so the loop builds the live
+clients from `conf`.  Offline callers - `kronos-replay`, unit tests -
+pass their own stubs to skip the network.
+
+`run_once(*, policies=None, aggregates=None) -> CycleReport` is the
+public single-cycle entry point.  It loads policies from disk and
+resolves aggregates from conf when not provided, then delegates to
+`_run_cycle`.  It does NOT initialise messaging, install signal
+handlers, validate the snapshot directory, or sleep between cycles -
+those concerns belong to `start()`, which now calls `run_once()` once
+per interval.
+
+`self.timings: dict[str, float] | None` is an opt-in per-phase
+wall-clock accumulator.  When set (typically to `{}` by the caller),
+`_evaluate_aggregate` adds seconds spent in the scorer, profiler,
+evacuator, enforcer, and planner phases to it on every cycle.
+Production leaves it as `None` and pays no timer cost.  `kronos-replay
+--time` populates it and prints the totals after `run_once()`.
 
 ---
 
