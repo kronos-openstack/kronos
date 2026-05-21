@@ -29,8 +29,11 @@ QUARANTINE_ERROR_TYPES = frozenset(
     {"PreFlightError", "MigrationFailed", "MigrationTimeout"},
 )
 # Transient infrastructure errors - no quarantine, just let the normal
-# instance cooldown take effect.
-TRANSIENT_ERROR_TYPES = frozenset({"NovaClientError"})
+# instance cooldown take effect.  PlacementRejected lives here because a
+# capacity shortfall on the destination is expected to resolve on its
+# own once other moves complete or VMs free their claims; quarantining
+# the VM would just pin a healthy workload to a hot host.
+TRANSIENT_ERROR_TYPES = frozenset({"NovaClientError", "PlacementRejected"})
 
 
 class MigrationResultEndpoint:

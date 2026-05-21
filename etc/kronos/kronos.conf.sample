@@ -32,6 +32,42 @@
 # Hosts with state=down are skipped - live migration cannot drain them.
 # evacuate_disabled_hosts = false
 
+# Nova-placement claims gate (default: true).
+# When enabled, every candidate destination is intersected with the
+# placement headroom -- (total - reserved) * allocation_ratio - usage --
+# for VCPU / MEMORY_MB / DISK_GB before the planner picks it.
+# Prevents Nova from rejecting live-migrate at execute time with
+# '400 No valid host was found' when the reserved-capacity ceiling
+# (cpu_allocation_ratio / ram_allocation_ratio / disk_allocation_ratio)
+# is tighter than actual Prometheus-measured utilization.
+#
+# Pluggable: the same gate applies uniformly to spread, pack,
+# evacuator, and affinity-enforcer moves -- it slots into the
+# ConstraintChecker, so all four planning paths share one check.
+#
+# Reads from the Placement API on the same keystoneauth1 session
+# configured under [nova]; the Kronos service user needs at least
+# 'placement:resource_providers:list',
+# 'placement:resource_providers:inventories:list', and
+# 'placement:resource_providers:usages:list' (covered by the default
+# 'reader' role on most clouds).
+#
+# Set to false to disable the gate (e.g. when Placement is
+# unreachable) and fall back to letting Nova reject the claim at
+# live-migrate time -- PlacementRejected failures are then treated
+# as transient by the result listener (no quarantine).
+# enforce_placement_claims = true
+
+# Account for DISK_GB in the placement check. Off by default
+# because Ceph-backed (RBD) ephemeral storage reports the same
+# pool capacity on every compute, and Nova does not re-claim
+# DISK_GB on the destination during a shared-storage live
+# migration -- enforcing it would over-reject perfectly legal
+# moves. Turn this on only for clusters with genuinely local
+# ephemeral root disk, identified by per-compute DISK_GB totals
+# that vary with the hardware (vs. identical across all hosts).
+# enforce_placement_disk = false
+
 [prometheus]
 # Prometheus base URL (required).
 # url = http://prometheus:9090

@@ -102,6 +102,26 @@ class HostNotFound(NovaClientError):
     code = 404
 
 
+# --- Placement ---
+
+class PlacementClientError(KronosException):
+    msg_fmt = "Placement API error: %(reason)s"
+
+
+class PlacementRejected(KronosException):
+    """Nova rejected a live-migrate because the destination's placement
+    claim (vcpus/ram/disk after the allocation_ratio multipliers) would
+    overflow.  Treated as transient: capacity may free up next cycle
+    once other moves complete; the result listener does *not*
+    quarantine the VM, only the regular instance cooldown applies.
+    """
+
+    msg_fmt = (
+        "Placement rejected live migration of '%(instance_uuid)s' to "
+        "'%(to_host)s': %(reason)s"
+    )
+
+
 # --- Engine ---
 
 class PolicyEvaluationError(KronosException):

@@ -11,13 +11,58 @@ from dataclasses import dataclass, field
 
 import openstack
 from keystoneauth1 import loading as ks_loading
+from openstack import exceptions as os_exc
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from kronos.common.config import NOVA_GROUP
-from kronos.common.exceptions import AggregateNotFound, NovaClientError
+from kronos.common.exceptions import (
+    AggregateNotFound,
+    NovaClientError,
+    PlacementRejected,
+)
 
 LOG = logging.getLogger(__name__)
+
+
+# Nova surfaces a placement / claims-tracker rejection as a 400-class
+# response whose ``error_name`` (microversion >= 2.84) is ``NoValidHost``
+# or whose body contains the ``noValidHost`` envelope.  We classify
+# these as :class:`PlacementRejected` so the result listener can treat
+# them as transient (free capacity may open up next cycle) instead of
+# quarantining the VM the way it does for ``MigrationFailed`` /
+# ``PreFlightError``.  Anything else is a genuine API error and stays
+# :class:`NovaClientError`.
+_PLACEMENT_REJECTION_NAMES = frozenset({"novalidhost", "noallocationonprovider"})
+_PLACEMENT_REJECTION_KEYS = frozenset({"novalidhost"})
+
+
+def _raise_for_live_migrate_http_error(
+    exc: os_exc.HttpException,
+    instance_uuid: str,
+    dest_host: str,
+) -> None:
+    """Translate a Nova HTTP error into the right Kronos exception type."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "http_status", None)
+    error_name = (getattr(exc, "error_name", "") or "").lower()
+    body = getattr(exc, "details", None) or getattr(exc, "response_body", None)
+    body_keys: set[str] = set()
+    if isinstance(body, dict):
+        body_keys = {str(k).lower() for k in body}
+
+    is_placement = (
+        error_name in _PLACEMENT_REJECTION_NAMES
+        or bool(body_keys & _PLACEMENT_REJECTION_KEYS)
+    )
+    if is_placement and status in (400, 409):
+        raise PlacementRejected(
+            instance_uuid=instance_uuid,
+            to_host=dest_host,
+            reason=str(exc),
+        ) from exc
+    raise NovaClientError(
+        reason=f"Failed to request live migration for {instance_uuid}: {exc}",
+    ) from exc
 
 
 @dataclass
@@ -46,6 +91,7 @@ class Instance:
     flavor_vcpus: int
     flavor_ram_mb: int
     status: str
+    flavor_disk_gb: int = 0
     server_groups: list[str] = field(default_factory=list)
 
 
@@ -267,6 +313,7 @@ class NovaClient:
                     host=getattr(s, "hypervisor_hostname", host),
                     flavor_vcpus=flavor.get("vcpus", 0),
                     flavor_ram_mb=flavor.get("ram", 0),
+                    flavor_disk_gb=flavor.get("disk", 0),
                     status=s.status,
                 )
             )
@@ -414,6 +461,8 @@ class NovaClient:
                 instance_uuid,
                 dest_host,
             )
+        except os_exc.HttpException as exc:
+            _raise_for_live_migrate_http_error(exc, instance_uuid, dest_host)
         except Exception as exc:
             raise NovaClientError(
                 reason=f"Failed to request live migration for {instance_uuid}: {exc}"

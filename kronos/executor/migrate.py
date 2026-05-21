@@ -18,6 +18,7 @@ from kronos.common.exceptions import (
     MigrationFailed,
     MigrationTimeout,
     NovaClientError,
+    PlacementRejected,
     PreFlightError,
 )
 from kronos.engine.types import MigrationPhase, MigrationResult, MigrationTask
@@ -95,7 +96,13 @@ class MigrationRunner:
                 retry_count=task.retry_count,
                 completed_at=datetime.now(tz=UTC).isoformat(),
             )
-        except (PreFlightError, MigrationFailed, MigrationTimeout, NovaClientError) as exc:
+        except (
+            PreFlightError,
+            MigrationFailed,
+            MigrationTimeout,
+            PlacementRejected,
+            NovaClientError,
+        ) as exc:
             duration = time.monotonic() - started
             LOG.error(
                 "Migration %s failed after %.1fs: %s",

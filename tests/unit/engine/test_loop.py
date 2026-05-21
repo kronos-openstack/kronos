@@ -116,6 +116,9 @@ def mock_engine():
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
         conf.engine.evacuate_disabled_hosts = False
+        # Disable the placement gate for these tests; covered in
+        # tests/unit/engine/test_placement.py.
+        conf.engine.enforce_placement_claims = False
 
         engine = EngineLoop(conf)
         engine._nova = mock_nova_cls.return_value
@@ -586,6 +589,7 @@ class TestDependencyInjection:
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
         conf.engine.evacuate_disabled_hosts = False
+        conf.engine.enforce_placement_claims = False
 
         nova = MagicMock()
         prom = MagicMock()
@@ -625,6 +629,7 @@ class TestDependencyInjection:
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
         conf.engine.evacuate_disabled_hosts = False
+        conf.engine.enforce_placement_claims = False
 
         timings: dict[str, float] = {}
         with (
@@ -641,6 +646,7 @@ class TestDependencyInjection:
         conf.engine.enforce_hard_affinity = False
         conf.engine.enforce_soft_affinity = False
         conf.engine.evacuate_disabled_hosts = False
+        conf.engine.enforce_placement_claims = False
         with (
             patch("kronos.engine.loop.NovaClient"),
             patch("kronos.engine.loop.PrometheusClient"),

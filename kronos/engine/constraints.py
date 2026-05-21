@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from oslo_log import log as logging
 
 from kronos.clients.nova import ComputeService, NovaClient
+from kronos.engine.placement import PlacementGate
 from kronos.engine.types import VmProfile
 
 LOG = logging.getLogger(__name__)
@@ -69,6 +70,40 @@ class ConstraintChecker:
         # The engine loop installs this every cycle via set_services();
         # when it is None, every destination is considered unavailable.
         self._services: dict[str, ComputeService] | None = None
+        # Optional Nova-placement claims gate.  When installed, every
+        # destination must also satisfy the VM's flavor claim against
+        # the cached placement headroom.  Pluggable so spread, pack,
+        # the evacuator, and the affinity enforcer all run through the
+        # same check by virtue of using this checker.
+        self._placement_gate: PlacementGate | None = None
+
+    def set_placement_gate(self, gate: PlacementGate | None) -> None:
+        """Install (or remove) the per-cycle placement claims gate.
+
+        ``None`` (the default) skips the placement check entirely, which
+        is the bit-for-bit pre-existing behaviour.  When set, the gate
+        is consulted from :meth:`check` on every candidate move and
+        from :meth:`commit_move` on every accepted move.
+        """
+        self._placement_gate = gate
+
+    def commit_move(
+        self,
+        vm: VmProfile,
+        from_host: str,
+        to_host: str,
+    ) -> None:
+        """Notify the placement gate (if any) of an accepted move.
+
+        Called by the planner, the affinity enforcer, and the
+        evacuator right after they commit a move.  Updates the
+        placement ledger so subsequent speculative candidates in the
+        same cycle see truthful headroom.
+        """
+        if self._placement_gate is not None:
+            self._placement_gate.commit_move(
+                vm.instance_uuid, from_host, to_host,
+            )
 
     def set_services(self, services: dict[str, ComputeService] | None) -> None:
         """Install per-cycle nova-compute service state.
@@ -117,6 +152,14 @@ class ConstraintChecker:
                 vm.instance_uuid,
                 dest_host,
             )
+            return False
+
+        if (
+            self._placement_gate is not None
+            and not self._placement_gate.is_destination_ok(
+                vm.instance_uuid, dest_host,
+            )
+        ):
             return False
 
         groups = self._get_groups()
@@ -268,12 +311,16 @@ class ConstraintChecker:
         return self._groups
 
     def invalidate_cache(self) -> None:
-        """Clear cached server groups and service state.
+        """Clear cached server groups, service state, and placement gate.
 
         Call between engine cycles.  Server groups are re-fetched lazily
         on the next ``check()``.  Service state must be re-installed
         via :meth:`set_services` before the planner runs - until then
-        the checker fails closed.
+        the checker fails closed.  The placement gate (when in use) is
+        cleared too; the engine loop re-installs a fresh ledger every
+        cycle.
         """
         self._groups = None
         self._services = None
+        if self._placement_gate is not None:
+            self._placement_gate.invalidate()
