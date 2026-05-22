@@ -263,10 +263,10 @@ class AffinityEnforcer:
         if best_step is None:
             return None
 
-        state.apply(
-            vm_profiles[best_step.instance_uuid],
-            best_step.from_host,
-            best_step.to_host,
+        moved_vm = vm_profiles[best_step.instance_uuid]
+        state.apply(moved_vm, best_step.from_host, best_step.to_host)
+        self._constraints.commit_move(
+            moved_vm, best_step.from_host, best_step.to_host,
         )
         move_vm_between_hosts(vms_by_host, best_step)
         return best_step

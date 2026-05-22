@@ -76,7 +76,18 @@ them out through the Nova live-migrate API.
     `[engine] evacuate_disabled_hosts`. Evacuation runs before the
     affinity enforcer and the imbalance planner and shares the same
     `max_migrations_per_cycle` budget.
-11. **Executor** consumes migration tasks, validates pre-flight state,
+11. **Placement claims gate** (on by default) intersects every
+    candidate destination with the Nova placement headroom
+    (`cpu_allocation_ratio` and `ram_allocation_ratio` applied;
+    `disk_allocation_ratio` is opt-in via
+    `[engine] enforce_placement_disk` because Ceph-backed clouds
+    report shared pool capacity per compute and live-migrate on
+    shared storage doesn't re-claim disk) so the planner doesn't
+    propose moves Nova would later reject at live-migrate time.
+    Pluggable: the same gate applies uniformly to spread, pack,
+    evacuator, and affinity-enforcer moves. Disable entirely via
+    `[engine] enforce_placement_claims = false`.
+12. **Executor** consumes migration tasks, validates pre-flight state,
     re-checks service state for source and destination, calls Nova
     live-migrate, polls until completion, and verifies post-flight.
 
@@ -157,6 +168,19 @@ enforce_soft_affinity = false
 # Optional: evacuate VMs off hosts whose nova-compute service is
 # administratively disabled (status=disabled). Off by default.
 evacuate_disabled_hosts = false
+
+# Intersect every candidate destination with the placement claim
+# headroom (cpu and ram allocation ratios applied) before the
+# planner picks it. Applies uniformly to spread, pack, evacuator,
+# and affinity-enforcer moves. Defaults to true.
+enforce_placement_claims = true
+
+# Also account for DISK_GB headroom. Off by default - Ceph-backed
+# ephemeral clouds report the same pool capacity on every compute
+# and Nova does not re-claim DISK_GB on a shared-storage live
+# migration, so enforcing disk would over-reject. Enable only when
+# ephemeral root disk is genuinely local.
+enforce_placement_disk = false
 
 [prometheus]
 url = http://prometheus:9090
@@ -302,18 +326,25 @@ It evaluates all enabled policies against each aggregate every cycle:
    `status=disabled`. Runs before the affinity enforcer.
 7. **Enforce** (optional) - when `enforce_hard_affinity` / `enforce_soft_affinity` is set,
    propose repair moves for VMs already violating their groups
-8. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
+8. **Placement claims gate** - when `enforce_placement_claims` is on
+   (default), every candidate destination must also have placement
+   headroom for the VM's flavor claim (vcpu/ram/disk with
+   allocation ratios applied). Pluggable into the constraint
+   checker so spread, pack, evacuator, and the affinity enforcer
+   share the same gate.
+9. **Plan** - simulate moves minimizing the weighted combined imbalance, sharing the
    per-cycle migration budget with the evacuator and enforcer
-9. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
-   task carries a `phase` field (`evacuate`, `affinity`, `spread`, or `pack`) that
-   surfaces in logs so operators can see why each migration was proposed
-10. **Cooldown** - record aggregate-level and instance-level cooldown on plan
+10. **Cast** - send `MigrationTask` over RPC to `kronos.migrations.<aggregate>`. Each
+    task carries a `phase` field (`evacuate`, `affinity`, `spread`, or `pack`) that
+    surfaces in logs so operators can see why each migration was proposed
+11. **Cooldown** - record aggregate-level and instance-level cooldown on plan
     emission; skip VMs already in cooldown or quarantine on the next cycle
-11. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
+12. **Result listener** - subscribe to `kronos.results.<aggregate>`, quarantine
     VMs on a definitive failure (PreFlightError, MigrationFailed,
     MigrationTimeout) so the planner stops re-proposing them. Transient
-    NovaClientError failures are not quarantined; the normal instance
-    cooldown governs re-planning.
+    NovaClientError and PlacementRejected failures are not quarantined;
+    the normal instance cooldown governs re-planning, since placement
+    capacity is expected to free up on subsequent cycles.
 
 ### Executor (migration runner)
 

@@ -27,6 +27,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 from kronos.clients.nova import ComputeService, NovaClient
+from kronos.clients.placement import PlacementClient, ProviderSnapshot
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.messaging import (
     get_notification_listener,
@@ -43,6 +44,7 @@ from kronos.engine.affinity_enforcer import AffinityEnforcer
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.cooldown import CooldownTracker
 from kronos.engine.evacuator import Evacuator
+from kronos.engine.placement import FlavorFootprint, PlacementGate
 from kronos.engine.planner import Planner
 from kronos.engine.profiler import VmProfiler
 from kronos.engine.result_listener import MigrationResultEndpoint
@@ -70,6 +72,7 @@ class EngineLoop:
         *,
         nova: NovaClient | None = None,
         prometheus: PrometheusClient | None = None,
+        placement: PlacementClient | None = None,
         cooldown: CooldownTracker | None = None,
         timings: dict[str, float] | None = None,
     ) -> None:
@@ -81,6 +84,24 @@ class EngineLoop:
         self._scorer = PolicyScorer(self._prometheus)
         self._profiler = VmProfiler(self._prometheus, self._nova)
         self._constraints = ConstraintChecker(self._nova)
+        # Pluggable placement claims gate.  When enabled, every
+        # candidate destination is intersected with the placement
+        # headroom (cpu/ram/disk allocation ratios applied) before
+        # the planner picks it.  When disabled it is a no-op and the
+        # planner falls back to letting Nova reject the claim at
+        # execute time.  The constraint checker holds the gate so it
+        # applies uniformly to spread, pack, evacuator, and the
+        # affinity enforcer.
+        self._placement_enabled = bool(conf.engine.enforce_placement_claims)
+        self._placement: PlacementClient | None = placement
+        if self._placement_enabled and self._placement is None:
+            self._placement = PlacementClient(conf)
+        self._placement_gate = PlacementGate(
+            enabled=self._placement_enabled,
+            account_disk=bool(conf.engine.enforce_placement_disk),
+        )
+        if self._placement_enabled:
+            self._constraints.set_placement_gate(self._placement_gate)
         self._planner = Planner(self._constraints)
         self._enforcer = AffinityEnforcer(
             self._constraints,
@@ -433,6 +454,14 @@ class EngineLoop:
         services = self._fetch_services()
         self._constraints.set_services(services)
 
+        # Per-cycle placement headroom snapshot (only fetched when the
+        # claims gate is enabled).  Installed on the pluggable gate so
+        # the constraint checker rejects destinations whose vcpu / ram /
+        # disk reservation would overflow.  Per-aggregate flavor
+        # footprints are populated lazily inside `_evaluate_aggregate`.
+        if self._placement_enabled:
+            self._placement_gate.set_snapshots(self._fetch_placement_snapshots())
+
         report = CycleReport(
             cycle_number=self._cycle_count,
             started_at=started_at,
@@ -475,6 +504,26 @@ class EngineLoop:
             )
             return {}
         return {svc.host: svc for svc in services}
+
+    def _fetch_placement_snapshots(self) -> dict[str, ProviderSnapshot]:
+        """Fetch placement resource-provider snapshots once per cycle.
+
+        On failure we log and fall back to an empty map.  The placement
+        gate then fails closed for every destination (no headroom data
+        means we cannot prove a claim fits) - safer than silently
+        forwarding plans that Nova would later reject at execute time.
+        """
+        if self._placement is None:
+            return {}
+        try:
+            return self._placement.fetch_snapshots()
+        except Exception:
+            LOG.warning(
+                "Failed to fetch placement snapshots; placement gate "
+                "will reject every destination this cycle.",
+                exc_info=True,
+            )
+            return {}
 
     def _evaluate_aggregate(
         self,
@@ -552,11 +601,21 @@ class EngineLoop:
             for p, pr in zip(active_policies, active_results, strict=True)
         }
         t0 = time.perf_counter()
+        # When the placement gate is on, collect per-VM flavor
+        # footprints during the same profiler pass and install them on
+        # the gate.  This keeps the planner -> gate -> commit cycle
+        # self-contained at the per-aggregate level.
+        flavor_sink: dict[str, FlavorFootprint] | None = (
+            {} if self._placement_enabled else None
+        )
         vm_profiles = self._profiler.collect(
             policies=active_policies,
             hosts=hosts,
             host_scores_by_policy=host_scores_by_policy,
+            flavor_sink=flavor_sink,
         )
+        if flavor_sink is not None:
+            self._placement_gate.set_flavors(flavor_sink)
         self._time_phase("profiler", t0)
         vm_profiles = self._drop_vms_on_unreachable_hosts(
             vm_profiles, hosts, services, name,

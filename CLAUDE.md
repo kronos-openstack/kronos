@@ -56,6 +56,22 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
   one budget. Hosts with `state=down` are not evacuated - live
   migration cannot drain them. Storage is intentionally not
   validated; Nova's `block_migration='auto'` decides per-VM.
+- **Placement claims gate**: when `[engine] enforce_placement_claims
+  = true` (default), every candidate destination is intersected with
+  the Nova placement headroom (`(total - reserved) * allocation_ratio
+  - usage` for VCPU and MEMORY_MB; DISK_GB only when
+  `[engine] enforce_placement_disk = true`, off by default) before
+  the planner picks it. Plugs into `ConstraintChecker` so the same check applies
+  uniformly to spread, pack, evacuator, and affinity-enforcer moves.
+  The gate maintains a per-cycle ledger; each accepted move calls
+  `constraints.commit_move(...)` to debit the destination and credit
+  the source so subsequent speculative candidates see truthful
+  headroom. The cluster-wide placement snapshot is fetched once per
+  cycle alongside `os-services`. When the gate cannot reach the
+  Placement API the ledger is empty and every destination is
+  rejected (fail closed) - safer than emitting plans Nova will
+  reject. `PlacementRejected` at execute time is treated as transient
+  (no quarantine) because capacity may free up next cycle.
 
 ## OpenStack Conventions - MUST FOLLOW
 - **oslo.config** for all daemon configuration (`kronos.conf`)
@@ -274,6 +290,12 @@ calls Nova live-migrate directly.
 - `evacuator.py` - `Evacuator`: drains VMs off `status=disabled`
   nova-compute hosts. Runs before the affinity enforcer and the
   planner; uses the same combined-imbalance + threshold math
+- `placement.py` - `PlacementGate`: pluggable Nova claims-tracker
+  gate. Held by `ConstraintChecker`; intersects every candidate
+  destination with the placement headroom (vcpu/ram/disk after the
+  allocation ratios) and maintains a per-cycle ledger that the
+  movers update via `constraints.commit_move(...)` after each
+  accepted move
 - `loop.py` - `EngineLoop`: periodic per-aggregate evaluation cycle, plan emission via RPC cast, result-listener lifecycle
 
 ### Scope resolution
@@ -411,11 +433,75 @@ ones. They will later be promoted to weighted planner penalties (so a
 move that mildly violates a soft rule can still win if it resolves a
 much larger imbalance), but for now both flavours veto.
 
+When the placement gate is installed (see below), it runs after the
+service-availability check and before the server-group checks - any
+of the three may veto a candidate destination.
+
 The cache is invalidated each engine cycle.
 
 Future: NUMA, CPU feature flags, flavor extra specs, soft-rule
 penalties in the planner -
 https://docs.openstack.org/nova/latest/user/server-groups.html
+
+### Placement claims gate
+
+`PlacementGate` (in `placement.py`) is the pluggable hook that closes
+the gap between Prometheus-measured utilization (what the scorer
+reasons about) and Nova's reserved-capacity ceiling (what the claims
+tracker enforces at live-migrate time).
+
+Enabled by default via `[engine] enforce_placement_claims = true`.
+When off, the gate is not installed on the `ConstraintChecker` and
+behaviour is bit-for-bit unchanged.
+
+When on:
+
+1. At cycle start the engine calls
+   `PlacementClient.fetch_snapshots()` (one call to the Placement
+   API) and installs the result via
+   `PlacementGate.set_snapshots(...)`. Headroom per (host, resource
+   class) is `(total - reserved) * allocation_ratio - usage` for
+   VCPU / MEMORY_MB / DISK_GB.
+2. Per aggregate the `VmProfiler.collect()` call passes a
+   `flavor_sink` dict that gets filled with one `FlavorFootprint`
+   (vcpus / memory_mb / disk_gb) per visible instance; the loop
+   installs it via `PlacementGate.set_flavors(...)`.
+3. `ConstraintChecker.check(vm, dest, ...)` calls
+   `gate.is_destination_ok(vm.instance_uuid, dest)` between the
+   service-availability check and the server-group checks. The same
+   gate applies uniformly to spread, pack, evacuator, and affinity
+   enforcer moves - that's the pluggability property.
+4. Each mover calls `constraints.commit_move(vm, from, to)`
+   immediately after `state.apply(...)`. The constraint checker
+   forwards to `PlacementGate.commit_move(...)`, which debits the
+   destination and credits the source so subsequent speculative
+   candidates within the same cycle see truthful headroom.
+5. Cache lifecycle: `ConstraintChecker.invalidate_cache()` also
+   clears the gate. The loop refreshes the snapshot on the next
+   cycle.
+
+Failure model: when the Placement API call fails the snapshot is
+empty and the gate rejects every destination (fails closed),
+matching the service-state gate's fail-closed semantics. Operators
+see the planning pause in the logs and can fix the placement
+endpoint without Kronos silently forwarding plans Nova will reject.
+
+`PlacementClient` lives in `kronos/clients/placement.py` and uses
+the same keystoneauth1 session loaded for Nova. Resource classes
+tracked: `VCPU`, `MEMORY_MB`, `DISK_GB`.
+
+**DISK_GB is opt-in** via `[engine] enforce_placement_disk` (default
+`false`). Most production OpenStack clouds run Ceph-backed (RBD)
+ephemeral storage; Nova / Kolla reports the Ceph pool capacity as
+each compute's local `DISK_GB` inventory but does **not** re-claim
+`DISK_GB` on the destination during a shared-storage live
+migration. Enforcing the disk check on those clouds would
+over-reject moves Nova would happily accept. Local-disk clusters
+(qcow2 ephemeral on `/var/lib/nova/instances`) can opt in; the
+operator-facing signal is whether per-compute `DISK_GB` totals
+vary with hardware or are identical to the byte across the
+aggregate (identical => almost certainly shared storage =>
+leave the knob off).
 
 ### Host evacuation
 
@@ -531,6 +617,7 @@ the *candidate set for movement* is filtered.
 | `migration.failed` | `retry_count < max_retries` (retry pending) | DEBUG log, no state change |
 | `migration.failed` | final attempt, `error_type` in `{PreFlightError, MigrationFailed, MigrationTimeout}` | INFO log, `quarantine_instance(uuid, instance_quarantine_seconds)` |
 | `migration.failed` | final attempt, `error_type == NovaClientError` | INFO log; no quarantine (transient infra error) |
+| `migration.failed` | final attempt, `error_type == PlacementRejected` | INFO log; no quarantine (placement capacity tight, expected to free up next cycle) |
 | `migration.failed` | final attempt, unknown `error_type` | INFO log, defensive quarantine |
 
 `EngineLoop._init_messaging` creates one notification listener per

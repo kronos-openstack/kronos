@@ -13,6 +13,7 @@ from oslo_log import log as logging
 
 from kronos.clients.nova import Instance, NovaClient
 from kronos.clients.prometheus import PrometheusClient
+from kronos.engine.placement import FlavorFootprint
 from kronos.engine.types import VmProfile
 from kronos.policies.models import (
     PolicyConfig,
@@ -45,6 +46,7 @@ class VmProfiler:
         policies: list[PolicyConfig],
         hosts: list[str],
         host_scores_by_policy: dict[str, dict[str, float]],
+        flavor_sink: dict[str, FlavorFootprint] | None = None,
     ) -> dict[str, VmProfile]:
         """Collect VM profiles for all instances on the aggregate's hosts.
 
@@ -52,6 +54,13 @@ class VmProfiler:
         :param hosts: Hostnames in the aggregate.
         :param host_scores_by_policy: ``{policy_name: {host: raw_score}}``
             (used by fallback strategies).
+        :param flavor_sink: Optional mapping that, when provided, is
+            populated with one :class:`~kronos.engine.placement.FlavorFootprint`
+            per *every* listed instance (vcpus / ram_mb / disk_gb from the
+            instance's Nova flavor).  Filled regardless of whether the VM
+            survives the per-policy fallback drop, so the placement gate
+            can still rate-limit candidates the planner didn't end up
+            promoting.  Callers that don't care can omit it.
         :returns: Mapping of instance UUID -> VmProfile (with per-policy weights).
         """
         instances = self._collect_instances(hosts)
@@ -74,6 +83,12 @@ class VmProfiler:
 
         profiles: dict[str, VmProfile] = {}
         for instance in instances:
+            if flavor_sink is not None:
+                flavor_sink[instance.uuid] = FlavorFootprint(
+                    vcpus=instance.flavor_vcpus,
+                    memory_mb=instance.flavor_ram_mb,
+                    disk_gb=instance.flavor_disk_gb,
+                )
             weights: dict[str, float] = {}
             sources: dict[str, str] = {}
             drop = False

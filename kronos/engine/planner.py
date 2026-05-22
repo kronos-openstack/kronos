@@ -163,6 +163,12 @@ class Planner:
             vm = _find_vm(vms_by_host, step.from_host, step.instance_uuid)
             if vm is not None:
                 state.apply(vm, step.from_host, step.to_host)
+                # Update the placement gate (if any) so the next round
+                # sees the post-move headroom.  No-op when the gate is
+                # disabled.
+                self._constraints.commit_move(
+                    vm, step.from_host, step.to_host,
+                )
             move_vm_between_hosts(vms_by_host, step)
 
     def _find_best_spread_move(
@@ -289,6 +295,9 @@ class Planner:
                 plan.steps.append(step)
 
                 state.apply(vm, source_host, dest)
+                # Keep the placement headroom ledger consistent across
+                # FFD candidate evaluations within the same cycle.
+                self._constraints.commit_move(vm, source_host, dest)
                 move_vm_between_hosts(vms_by_host, step)
                 migrations_done += 1
 

@@ -208,6 +208,48 @@ engine_opts = [
             "breaching any policy threshold."
         ),
     ),
+    cfg.BoolOpt(
+        "enforce_placement_claims",
+        default=True,
+        help=(
+            "When true (default), intersect every candidate destination "
+            "with the placement claim headroom (cpu_allocation_ratio / "
+            "ram_allocation_ratio / disk_allocation_ratio applied) "
+            "before the planner picks it. Without this gate, pack "
+            "plans that look fine to the Prometheus-driven scorer "
+            "can hit '400 No valid host was found' at Nova "
+            "live-migrate time because the reserved-capacity ceiling "
+            "is tighter than actual utilization. Requires the Kronos "
+            "service user to have read access to the Placement API. "
+            "Set to false to disable the gate (e.g. in environments "
+            "where the placement endpoint is unreachable) and fall "
+            "back to letting Nova reject the claim at execute time. "
+            "The check is pluggable: it applies uniformly to spread, "
+            "pack, evacuator, and affinity-enforcer moves."
+        ),
+    ),
+    cfg.BoolOpt(
+        "enforce_placement_disk",
+        default=False,
+        help=(
+            "Only meaningful when enforce_placement_claims is true. "
+            "When false (the default), the placement gate ignores "
+            "DISK_GB and only checks VCPU and MEMORY_MB headroom. "
+            "Set to true to also enforce DISK_GB. This is off by "
+            "default because Nova / Kolla deployments with "
+            "[libvirt] images_type = rbd (Ceph-backed ephemeral) "
+            "report the Ceph pool capacity as each compute's local "
+            "DISK_GB inventory and do not re-claim DISK_GB on the "
+            "destination during a live migration with shared "
+            "storage, so a DISK_GB check at plan time would "
+            "over-reject moves Nova would accept. Turn it on only "
+            "for clusters where ephemeral root disk is genuinely "
+            "local (qcow2 on /var/lib/nova/instances), which you "
+            "can identify by per-compute DISK_GB totals that vary "
+            "with the underlying hardware rather than being "
+            "identical across all hosts in the aggregate."
+        ),
+    ),
 ]
 
 prometheus_opts = [
