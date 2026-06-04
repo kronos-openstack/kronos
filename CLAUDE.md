@@ -17,7 +17,8 @@ It evaluates Prometheus metrics per host aggregate and plans live migrations to 
 - **Pure planner**: casts migration tasks over RPC (`oslo.messaging`
   `RPCClient.cast()`) to the per-aggregate executor topic. Never calls
   Nova live-migrate directly.
-- **Executor**: one per aggregate. Consumes RPC casts, runs pre-flight
+- **Executor**: services one or more aggregates, one independent unit
+  each (on its own threads). Consumes RPC casts, runs pre-flight
   checks, calls Nova live-migrate, polls status, publishes results as
   notifications.
 - **Aggregate boundaries**: migrations stay within an aggregate. The
@@ -704,15 +705,17 @@ the Nova live-migrate API. The executor never decides *what* to migrate
 - it only validates, executes, and reports results.
 
 ### Key files
-- `worker.py` - `ExecutorWorker`: top-level wiring (RPC server, scheduler, runner, result notifier); `MigrationRPCEndpoint`: RPC endpoint exposing `execute_migration`
+- `worker.py` - `ExecutorWorker`: supervisor that builds one `_AggregateExecutor` per scope and fans start/stop out to them, sharing only the two oslo.messaging transports; `_AggregateExecutor`: per-aggregate unit (RPC server, scheduler, runner, result notifier, retry client); `MigrationRPCEndpoint`: RPC endpoint exposing `execute_migration`
 - `scheduler.py` - `TaskScheduler`: priority queue sorted by `not_before`, semaphore for concurrency control
 - `migrate.py` - `MigrationRunner`: pre-flight check, Nova live-migrate, poll status, post-flight verify
 
 ### Deployment model
-- One executor per aggregate (or for the unassigned-hosts pool)
-- Started with either `--aggregate <name>` or `--unassigned`
+- One executor process services one or more aggregates (and/or the unassigned-hosts pool). Each aggregate is an independent `_AggregateExecutor` unit on its own threads, with its own scheduler, RPC server, Nova client, and runner; only the message transports are shared.
+- Started with one or more `--aggregate <name>` (repeatable) and/or `--unassigned`. `resolve_scopes()` in `kronos/cmd/executor.py` builds the ordered scope list (named aggregates first, then the unassigned pool as `None`), dropping duplicate names.
+- `max_concurrent_migrations` is a per-aggregate budget, so consolidating N single-aggregate processes into one multi-aggregate process is behaviour-identical (same total concurrency).
 - RPC topic: `kronos.migrations.<aggregate>` (or `kronos.migrations._unassigned_` for the unassigned pool)
 - Results topic: `kronos.results.<aggregate>`
+- Shutdown drains every unit in parallel under a single 15s watchdog; daemon threads mean anything still in flight dies with the process (Nova continues migrations it has already started).
 
 ### Messaging
 Two oslo.messaging primitives, each for a reason:
