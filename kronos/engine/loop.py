@@ -752,8 +752,7 @@ class EngineLoop:
         duration = (report.completed_at - report.started_at).total_seconds()
 
         LOG.info(
-            "Cycle %d finished in %.1fs (%d aggregates, %d errors)",
-            report.cycle_number,
+            "Cycle finished in %.1fs (%d aggregates, %d errors)",
             duration,
             len(report.aggregate_results),
             len(report.errors),
