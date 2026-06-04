@@ -298,8 +298,11 @@ def _detect_violations(
         hosts_used = {placement[u] for u in visible}
 
         if group.policy in ANTI_AFFINITY_POLICIES:
-            # Violation when two or more members share a host.
-            offenders = _anti_affinity_offenders(visible, placement)
+            # Violation when a host holds more than the group's
+            # max_server_per_host members (default 1 = strict spread).
+            offenders = _anti_affinity_offenders(
+                visible, placement, group.max_server_per_host,
+            )
             if offenders:
                 out.append(
                     _Violation(group=group, offending_uuids=frozenset(offenders)),
@@ -316,17 +319,20 @@ def _detect_violations(
 def _anti_affinity_offenders(
     member_uuids: frozenset[str] | set[str],
     placement: dict[str, str],
+    max_server_per_host: int = 1,
 ) -> set[str]:
-    """Every member that shares a host with at least one sibling.
+    """Every member on a host that exceeds ``max_server_per_host``.
 
-    All co-located members are flagged as offenders; which one to
-    actually move is decided by the destination-scoring pass.
+    All members co-located on an over-capacity host are flagged as
+    offenders; which one (and how many) to actually move is decided by
+    the destination-scoring pass, which re-detects after each repair
+    until the host is back within the cap.
     """
     by_host: dict[str, list[str]] = {}
     for uuid in member_uuids:
         by_host.setdefault(placement[uuid], []).append(uuid)
     offenders: set[str] = set()
     for uuids in by_host.values():
-        if len(uuids) > 1:
+        if len(uuids) > max_server_per_host:
             offenders.update(uuids)
     return offenders

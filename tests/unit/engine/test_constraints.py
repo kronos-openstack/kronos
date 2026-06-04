@@ -142,6 +142,71 @@ class TestAntiAffinity:
         assert checker.check(vm, "h2", {}) is True
 
 
+class TestAntiAffinityMaxServerPerHost:
+    """The Nova 2.64 ``max_server_per_host`` anti-affinity rule."""
+
+    def test_cap_of_two_allows_one_existing_member(
+        self, checker: ConstraintChecker, mock_nova: MagicMock,
+    ) -> None:
+        """With cap=2, moving onto a host holding one member is allowed."""
+        mock_nova.list_server_groups.return_value = [
+            {
+                "id": "g1",
+                "policies": ["anti-affinity"],
+                "members": ["vm-1", "vm-2", "vm-3"],
+                "rules": {"max_server_per_host": 2},
+            },
+        ]
+        vm = _vm("vm-1", "h1")
+        # h2 already holds one member (vm-2); cap is 2, so vm-1 fits.
+        vms_by_host = {"h2": [_vm("vm-2", "h2")]}
+        assert checker.check(vm, "h2", vms_by_host) is True
+
+    def test_cap_of_two_blocks_at_capacity(
+        self, checker: ConstraintChecker, mock_nova: MagicMock,
+    ) -> None:
+        """With cap=2, moving onto a host already holding two is blocked."""
+        mock_nova.list_server_groups.return_value = [
+            {
+                "id": "g1",
+                "policies": ["anti-affinity"],
+                "members": ["vm-1", "vm-2", "vm-3"],
+                "rules": {"max_server_per_host": 2},
+            },
+        ]
+        vm = _vm("vm-1", "h1")
+        vms_by_host = {"h2": [_vm("vm-2", "h2"), _vm("vm-3", "h2")]}
+        assert checker.check(vm, "h2", vms_by_host) is False
+
+    def test_absent_rules_default_to_strict(
+        self, checker: ConstraintChecker, mock_nova: MagicMock,
+    ) -> None:
+        """No rules dict (pre-2.64 cloud) means cap=1 - strict spread."""
+        mock_nova.list_server_groups.return_value = [
+            {"id": "g1", "policies": ["anti-affinity"], "members": ["vm-1", "vm-2"]},
+        ]
+        vm = _vm("vm-1", "h1")
+        vms_by_host = {"h2": [_vm("vm-2", "h2")]}
+        assert checker.check(vm, "h2", vms_by_host) is False
+
+    @pytest.mark.parametrize("bad", [0, -3, "two", None, 1.5])
+    def test_malformed_or_sub_one_rule_falls_back_to_strict(
+        self, checker: ConstraintChecker, mock_nova: MagicMock, bad: object,
+    ) -> None:
+        """A non-integer or < 1 cap degrades to strict anti-affinity."""
+        mock_nova.list_server_groups.return_value = [
+            {
+                "id": "g1",
+                "policies": ["anti-affinity"],
+                "members": ["vm-1", "vm-2"],
+                "rules": {"max_server_per_host": bad},
+            },
+        ]
+        vm = _vm("vm-1", "h1")
+        vms_by_host = {"h2": [_vm("vm-2", "h2")]}
+        assert checker.check(vm, "h2", vms_by_host) is False
+
+
 class TestAffinity:
     def test_affinity_allows_move_to_member_host(
         self, checker: ConstraintChecker, mock_nova: MagicMock,

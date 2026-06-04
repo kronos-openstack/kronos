@@ -54,6 +54,9 @@ them out through the Nova live-migrate API.
 5. **Constraint checker** respects all four Nova server-group placement
    policies: `affinity`, `anti-affinity`, `soft-affinity`, and
    `soft-anti-affinity`. A move that would break any of them is rejected.
+   The `anti-affinity` `max_server_per_host` rule (Nova API 2.64+) is
+   honored: the default of 1 is strict one-per-host, a higher value
+   allows that many group members to share a host.
 6. **Affinity enforcer** (optional) runs before the planner and proposes
    migrations to repair existing server-group violations. Enabled per
    policy class via `[engine] enforce_hard_affinity` and

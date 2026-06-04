@@ -262,6 +262,34 @@ class TestListServerGroups:
         result = mock_nova_client.list_server_groups()
         assert result[0]["policies"] == ["anti-affinity"]
 
+    def test_returns_rules_dict(self, mock_nova_client):
+        """The 2.64 'rules' dict is passed through unchanged."""
+        group = MagicMock()
+        group.id = "sg-4"
+        group.name = "capped"
+        group.policies = ["anti-affinity"]
+        group.policy = None
+        group.member_ids = ["uuid-1"]
+        group.rules = {"max_server_per_host": 3}
+        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+
+        result = mock_nova_client.list_server_groups()
+        assert result[0]["rules"] == {"max_server_per_host": 3}
+
+    def test_missing_rules_defaults_to_empty_dict(self, mock_nova_client):
+        """Pre-2.64 clouds report no rules; we normalise to an empty dict."""
+        group = MagicMock()
+        group.id = "sg-5"
+        group.name = "no-rules"
+        group.policies = ["anti-affinity"]
+        group.policy = None
+        group.member_ids = ["uuid-1"]
+        group.rules = None
+        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+
+        result = mock_nova_client.list_server_groups()
+        assert result[0]["rules"] == {}
+
     def test_api_error(self, mock_nova_client):
         mock_nova_client._mock_conn.compute.server_groups.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list server groups"):

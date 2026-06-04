@@ -421,8 +421,13 @@ fallback has no data for it.
 ### Constraint checking
 `ConstraintChecker` reads Nova server groups across all projects and
 treats **all four** placement policies as move-blocking:
-- `anti-affinity` / `soft-anti-affinity`: a move is rejected if another
-  group member already lives on the destination host
+- `anti-affinity` / `soft-anti-affinity`: a move is rejected if the
+  destination host already holds `max_server_per_host` other group
+  members. That rule (Nova API microversion 2.64+, `rules` dict on the
+  group) defaults to 1, so the default is strict one-member-per-host;
+  a higher value permits up to N members per host. Only `anti-affinity`
+  carries the rule upstream; every other policy stays at the implicit
+  cap of 1.
 - `affinity` / `soft-affinity`: a move is rejected unless every other
   *currently placed* member of the group is already on the destination
   host. Members outside the current aggregate are ignored - Kronos only
@@ -555,7 +560,9 @@ Both default false. The enforcer is a no-op when neither is enabled.
 **Algorithm**, per aggregate:
 1. Fetch the relevant server groups (filtered by enabled flags)
 2. Detect violations against current VM placement:
-   - `anti-affinity` / `soft-anti-affinity`: ≥2 members share a host
+   - `anti-affinity` / `soft-anti-affinity`: a host holds more than the
+     group's `max_server_per_host` members (default 1, so the default
+     trigger is >=2 members sharing a host)
    - `affinity` / `soft-affinity`: members span >1 host
 3. Collect the set of offending VM UUIDs across all violations
 4. Simulate every (offending_vm, destination) pair. Accept only pairs that:

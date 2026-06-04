@@ -4,10 +4,15 @@ Validates that a proposed VM move does not violate Nova server group
 placement rules.  All four Nova server group policy types are treated
 as move-blocking:
 
-* ``anti-affinity``: group members must be on separate hosts
+* ``anti-affinity``: group members must be on separate hosts, or at
+  most ``max_server_per_host`` per host when that rule is set
 * ``soft-anti-affinity``: best-effort spread; honored as a hint
 * ``affinity``: group members must be on the same host
 * ``soft-affinity``: best-effort co-location; honored as a hint
+
+The ``anti-affinity`` policy may carry a ``max_server_per_host`` rule
+(Nova API microversion 2.64+) that relaxes the one-per-host default to
+N-per-host.  It defaults to 1, which is plain strict anti-affinity.
 
 See https://docs.openstack.org/nova/latest/user/server-groups.html
 
@@ -39,11 +44,53 @@ AFFINITY_POLICIES = frozenset({"affinity", "soft-affinity"})
 
 @dataclass(frozen=True)
 class ServerGroup:
-    """A single Nova server group, parsed from openstacksdk output."""
+    """A single Nova server group, parsed from openstacksdk output.
+
+    ``max_server_per_host`` is the ``anti-affinity`` rule added in Nova
+    API microversion 2.64: at most this many group members may share a
+    single host.  It defaults to 1 (strict anti-affinity, one member per
+    host) and is only meaningful for ``anti-affinity`` groups - Nova
+    rejects the rule on any other policy, so it stays 1 elsewhere.
+    """
 
     group_id: str
     policy: str
     members: frozenset[str]
+    max_server_per_host: int = 1
+
+
+def _parse_max_server_per_host(
+    group: dict[str, object], group_id: str,
+) -> int:
+    """Extract the ``max_server_per_host`` anti-affinity rule.
+
+    Returns 1 (strict anti-affinity) when the rule is absent, malformed,
+    or below 1.  Clouds older than Nova API microversion 2.64 report no
+    ``rules`` dict at all, so this is the common case.
+    """
+    rules = group.get("rules")
+    if not isinstance(rules, dict):
+        return 1
+    raw = rules.get("max_server_per_host")
+    if raw is None:
+        return 1
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        LOG.warning(
+            "Server group %s has a non-integer max_server_per_host (%r); "
+            "treating as 1.",
+            group_id, raw,
+        )
+        return 1
+    if value < 1:
+        LOG.warning(
+            "Server group %s has max_server_per_host=%d (< 1); "
+            "treating as 1.",
+            group_id, value,
+        )
+        return 1
+    return value
 
 
 class ConstraintChecker:
@@ -194,18 +241,28 @@ class ConstraintChecker:
         dest_host: str,
         vms_by_host: dict[str, list[VmProfile]],
     ) -> bool:
-        """Reject if another group member already lives on ``dest_host``."""
+        """Reject if ``dest_host`` is already at the group's per-host cap.
+
+        With the default ``max_server_per_host`` of 1 this rejects any
+        move onto a host that already holds another group member (strict
+        anti-affinity).  A higher cap permits up to that many members per
+        host before vetoing.
+        """
         dest_vms = {v.instance_uuid for v in vms_by_host.get(dest_host, [])}
-        conflict = (group.members & dest_vms) - {vm.instance_uuid}
-        if conflict:
+        other_members_here = (group.members & dest_vms) - {vm.instance_uuid}
+        # After the move, dest_host would hold len(other_members_here) + 1
+        # group members.  Reject when that would exceed the cap.
+        if len(other_members_here) >= group.max_server_per_host:
             LOG.debug(
                 "%s violation: VM %s cannot move to %s "
-                "(group %s has members %s on that host).",
+                "(group %s already has %d/%d members on that host: %s).",
                 group.policy,
                 vm.instance_uuid,
                 dest_host,
                 group.group_id,
-                conflict,
+                len(other_members_here),
+                group.max_server_per_host,
+                other_members_here,
             )
             return False
         return True
@@ -299,6 +356,9 @@ class ConstraintChecker:
                     group_id=group_id,
                     policy=policy,
                     members=members,
+                    max_server_per_host=_parse_max_server_per_host(
+                        group, group_id,
+                    ),
                 ),
             )
 
