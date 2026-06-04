@@ -174,6 +174,20 @@ class NovaClient:
             session = ks_loading.load_session_from_conf_options(
                 conf, NOVA_GROUP, auth=auth,
             )
+            # Disable HTTP keep-alive on the Nova session.  The Nova API is
+            # fronted by a VIP (HAProxy / eventlet wsgi) that closes idle
+            # connections after a short timeout.  A pooled connection reused
+            # after an idle gap - between migration-status polls in the
+            # executor, or between cycles in the engine - lands on a
+            # half-closed socket and raises "Remote end closed connection
+            # without response".  keystoneauth retries and recovers, but
+            # logs a WARNING every time.  Sending "Connection: close" makes
+            # each request use a fresh connection so stale reuse never
+            # happens; the extra TCP setup is negligible at Kronos's request
+            # cadence.
+            requests_session = getattr(session, "session", None)
+            if requests_session is not None:
+                requests_session.headers["Connection"] = "close"
             self._conn = openstack.connection.Connection(session=session)
         except Exception as exc:
             raise NovaClientError(reason=f"Failed to connect: {exc}") from exc
