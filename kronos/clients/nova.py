@@ -388,7 +388,15 @@ class NovaClient:
         newer ones populate the list.  We merge both into a ``policies``
         list so the constraint checker has a single shape to reason about.
 
-        :returns: List of server group dicts with keys id, name, policies, members.
+        Nova API microversion 2.64 also added a ``rules`` dict.  The only
+        rule defined upstream is ``max_server_per_host``, valid for the
+        ``anti-affinity`` policy: it caps how many group members may share
+        a single host (default 1 = strict anti-affinity).  We pass the
+        dict through unchanged; clouds older than 2.64 report no rules and
+        the constraint checker falls back to the strict default.
+
+        :returns: List of server group dicts with keys id, name, policies,
+            members, rules.
         """
         try:
             groups = list(self._conn.compute.server_groups(all_projects=True))
@@ -407,12 +415,16 @@ class NovaClient:
             if raw_policy and str(raw_policy) not in policies:
                 policies.append(str(raw_policy))
 
+            raw_rules = getattr(g, "rules", None)
+            rules = dict(raw_rules) if isinstance(raw_rules, dict) else {}
+
             result.append(
                 {
                     "id": g.id,
                     "name": g.name,
                     "policies": policies,
                     "members": list(g.member_ids or []),
+                    "rules": rules,
                 },
             )
         return result

@@ -106,6 +106,38 @@ class TestDetectViolations:
         )
         assert violations == []
 
+    def test_max_server_per_host_allows_members_within_cap(self) -> None:
+        """With cap=2, two members sharing a host is compliant, not a violation."""
+        group = ServerGroup(
+            group_id="g",
+            policy="anti-affinity",
+            members=frozenset({"a", "b", "c"}),
+            max_server_per_host=2,
+        )
+        # Two on h1 (within cap), one on h2 - no host exceeds the cap.
+        violations = _detect_violations(
+            [group],
+            {"h1": [_vm("a", "h1"), _vm("b", "h1")], "h2": [_vm("c", "h2")]},
+        )
+        assert violations == []
+
+    def test_max_server_per_host_violation_when_over_cap(self) -> None:
+        """With cap=2, a host holding three members is a violation."""
+        group = ServerGroup(
+            group_id="g",
+            policy="anti-affinity",
+            members=frozenset({"a", "b", "c"}),
+            max_server_per_host=2,
+        )
+        violations = _detect_violations(
+            [group],
+            {"h1": [_vm("a", "h1"), _vm("b", "h1"), _vm("c", "h1")]},
+        )
+        assert len(violations) == 1
+        # All three co-located members are flagged; the scoring pass
+        # moves them one at a time until h1 is back within the cap.
+        assert violations[0].offending_uuids == frozenset({"a", "b", "c"})
+
     def test_affinity_violation_when_members_spread(self) -> None:
         group = ServerGroup(
             group_id="g",
