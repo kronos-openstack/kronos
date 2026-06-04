@@ -274,6 +274,11 @@ kronos-executor --config-file /etc/kronos/kronos.conf --aggregate my-aggregate
 
 # Or for the unassigned-hosts pool (clusters without aggregates)
 kronos-executor --config-file /etc/kronos/kronos.conf --unassigned
+
+# One process can service several aggregates (and the unassigned pool);
+# each runs as an independent unit on its own threads
+kronos-executor --config-file /etc/kronos/kronos.conf \
+    --aggregate gpu-aggregate --aggregate hpc-aggregate --unassigned
 ```
 
 ### Record & Replay (offline testing)
@@ -348,7 +353,8 @@ It evaluates all enabled policies against each aggregate every cycle:
 
 ### Executor (migration runner)
 
-One executor per aggregate consumes tasks from RabbitMQ:
+An executor consumes tasks from RabbitMQ for one or more aggregates (each
+serviced by an independent unit on its own threads):
 
 1. **Schedule** - priority queue sorted by `not_before` timestamps, semaphore for concurrency
 2. **Pre-flight** - verify instance is ACTIVE, no pending task_state, still on source host;

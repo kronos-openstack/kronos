@@ -4,11 +4,19 @@ Receives ``execute_migration`` RPC casts from the engine on the per-aggregate
 migrations topic, runs them via the scheduler, and publishes results as
 notifications on the results topic so all engines (active and passive) can
 update their cooldown state.
+
+One process can service several aggregates at once: the worker builds one
+independent :class:`_AggregateExecutor` per aggregate (or the unassigned
+pool), each with its own scheduler, RPC server, Nova client, and migration
+runner running on its own threads.  This is behaviour-identical to running
+one single-aggregate executor process per aggregate; the only thing shared
+across aggregates is the pair of oslo.messaging transports.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 import oslo_messaging
 from oslo_config import cfg
@@ -32,6 +40,17 @@ from kronos.executor.migrate import MigrationRunner
 from kronos.executor.scheduler import TaskScheduler
 
 LOG = logging.getLogger(__name__)
+
+# Total wall-clock budget for draining every aggregate on shutdown.  The
+# drain runs in daemon threads, so whatever is still in flight at the
+# deadline dies with the process - Nova continues any migration it has
+# already started regardless.
+_SHUTDOWN_DEADLINE_SECONDS = 15.0
+
+
+def _label(aggregate: str | None) -> str:
+    """Human-readable scope label; ``None`` is the unassigned pool."""
+    return aggregate if aggregate is not None else "<unassigned>"
 
 
 class MigrationRPCEndpoint:
@@ -65,133 +84,96 @@ class MigrationRPCEndpoint:
         self._scheduler.submit(migration_task)
 
 
-class ExecutorWorker:
-    """Top-level executor for one aggregate.
+class _AggregateExecutor:
+    """The per-aggregate execution unit.
 
-    Wires together:
+    Wires together, for a single aggregate (or the unassigned pool):
       - RPC server: consumes migration tasks (engine -> executor)
       - Notifier: publishes migration results (executor -> engines)
       - Scheduler: respects ``not_before`` and concurrency limits
       - Migration runner: pre-flight, Nova live-migrate, post-flight
-      - Retry notifier: re-casts failed tasks to the RPC topic
+      - Retry client: re-casts failed tasks to the RPC topic
+
+    The oslo.messaging transports are owned by the parent
+    :class:`ExecutorWorker` and shared across sibling units; everything
+    else here is private to this aggregate, so units never contend.
     """
 
-    def __init__(self, conf: cfg.ConfigOpts, aggregate: str | None) -> None:
+    def __init__(
+        self,
+        conf: cfg.ConfigOpts,
+        aggregate: str | None,
+        rpc_transport: oslo_messaging.Transport,
+        notification_transport: oslo_messaging.Transport,
+    ) -> None:
         self._conf = conf
-        # None means this executor services the unassigned-hosts pool
+        # None means this unit services the unassigned-hosts pool.
         self._aggregate = aggregate
-        self._aggregate_label = (
-            aggregate if aggregate is not None else "<unassigned>"
-        )
+        self._label = _label(aggregate)
 
         self._nova = NovaClient(conf)
         self._runner = MigrationRunner(conf, self._nova)
-
-        # Two transports: one for RPC (engine <-> executor),
-        # one for notifications (executor -> engines)
-        self._rpc_transport = get_rpc_transport(conf)
-        self._notification_transport = get_notification_transport(conf)
 
         publisher_suffix = (
             aggregate if aggregate is not None else UNASSIGNED_TOPIC_MARKER
         )
 
-        # Notifier for publishing results on the notification transport
+        # Notifier for publishing results on the notification transport.
         self._result_notifier = get_notifier(
-            self._notification_transport,
+            notification_transport,
             results_topic(aggregate),
             publisher_id=f"kronos-executor-{publisher_suffix}",
         )
 
-        # RPC client for re-casting retries back to the migrations topic
-        self._retry_rpc_client = get_rpc_client(self._rpc_transport, aggregate)
+        # RPC client for re-casting retries back to the migrations topic.
+        self._retry_rpc_client = get_rpc_client(rpc_transport, aggregate)
 
-        # Scheduler
+        # Scheduler: one concurrency budget per aggregate, matching the
+        # behaviour of a dedicated single-aggregate executor process.
         self._scheduler = TaskScheduler(
             max_concurrent=conf.executor.max_concurrent_migrations,
             on_result=self._publish_result,
             run_task=self._execute_with_retry,
         )
 
-        # RPC server (consumes engine casts)
+        # RPC server (consumes engine casts for this aggregate's topic).
         endpoint = MigrationRPCEndpoint(self._scheduler)
         self._rpc_server = get_rpc_server(
-            self._rpc_transport, aggregate, [endpoint],
+            rpc_transport, aggregate, [endpoint],
         )
 
-        # Blocks start() until stop() is called
-        self._stop_event = threading.Event()
+    @property
+    def label(self) -> str:
+        return self._label
 
     def start(self) -> None:
-        """Start the executor. Blocks until stop is requested.
-
-        Cleanup runs from this method (the main thread) once the stop
-        event fires, not from the signal handler.  oslo.messaging
-        ``stop()``/``wait()`` take locks that aren't safe to acquire
-        from a signal-handler context, and a re-entrant signal during
-        cleanup can deadlock.
-        """
-        LOG.info(
-            "Starting executor for aggregate '%s'",
-            self._aggregate_label,
-        )
+        """Start the scheduler and RPC server (both non-blocking)."""
         self._scheduler.start()
         self._rpc_server.start()
         LOG.info(
-            "Executor ready; RPC topic '%s'",
+            "Executor ready for aggregate '%s'; RPC topic '%s'",
+            self._label,
             migrations_topic(self._aggregate),
         )
-        # Block here - oslo.messaging RPC server consumes in background threads
-        self._stop_event.wait()
-        self._shutdown()
 
-    def request_stop(self) -> None:
-        """Async-signal-safe stop request.  Call from signal handlers."""
-        self._stop_event.set()
+    def drain(self) -> None:
+        """Stop the RPC server and scheduler, best-effort.
 
-    def stop(self) -> None:
-        """Synchronous stop: nudge the event and run cleanup inline.
-
-        Suitable for tests and any caller already on the main thread.
-        Signal handlers should call :meth:`request_stop` instead so
-        that cleanup runs from the daemon's main thread.
+        Exceptions are logged, not raised: shutdown must make progress
+        across every sibling unit even if one transport misbehaves.
         """
-        self._stop_event.set()
-        self._shutdown()
-
-    def _shutdown(self) -> None:
-        """Drain RPC + scheduler with a hard-exit watchdog.
-
-        ``MessageHandlingServer.wait()`` has no timeout in
-        oslo.messaging; if a consumer thread doesn't unwind we run the
-        drain in a daemon thread and give up after a deadline so the
-        process actually exits.  The scheduler's worker threads are
-        daemon, so anything still in-flight at deadline dies with the
-        process - migrations Nova has already started continue on
-        Nova's side regardless.
-        """
-        LOG.info("Stopping executor for aggregate '%s'", self._aggregate_label)
-
-        def _drain() -> None:
-            try:
-                self._rpc_server.stop()
-                self._rpc_server.wait()  # drain in-flight RPC handlers
-            except Exception as exc:
-                LOG.warning("Error stopping RPC server: %s", exc)
-            try:
-                self._scheduler.stop()
-            except Exception as exc:
-                LOG.warning("Error stopping scheduler: %s", exc)
-
-        drainer = threading.Thread(
-            target=_drain, name="executor-shutdown", daemon=True,
-        )
-        drainer.start()
-        drainer.join(timeout=15.0)
-        if drainer.is_alive():
+        try:
+            self._rpc_server.stop()
+            self._rpc_server.wait()  # drain in-flight RPC handlers
+        except Exception as exc:
             LOG.warning(
-                "Executor shutdown did not complete within 15s; "
-                "exiting anyway.",
+                "Error stopping RPC server for '%s': %s", self._label, exc,
+            )
+        try:
+            self._scheduler.stop()
+        except Exception as exc:
+            LOG.warning(
+                "Error stopping scheduler for '%s': %s", self._label, exc,
             )
 
     def _execute_with_retry(self, task: MigrationTask) -> MigrationResult:
@@ -244,3 +226,115 @@ class ExecutorWorker:
             result.task_id[:8],
             result.instance_uuid[:8],
         )
+
+
+class ExecutorWorker:
+    """Top-level executor supervising one or more aggregates.
+
+    Builds the two oslo.messaging transports once, then one independent
+    :class:`_AggregateExecutor` per scope in ``scopes``.  A scope of
+    ``None`` is the unassigned-hosts pool.  ``start()`` launches every
+    unit and blocks until a stop is requested.
+    """
+
+    def __init__(
+        self,
+        conf: cfg.ConfigOpts,
+        scopes: list[str | None],
+    ) -> None:
+        if not scopes:
+            raise ValueError(
+                "ExecutorWorker requires at least one aggregate scope",
+            )
+        self._conf = conf
+        self._scopes = scopes
+
+        # Two transports, shared across every aggregate unit: one for RPC
+        # (engine <-> executor), one for notifications (executor -> engines).
+        self._rpc_transport = get_rpc_transport(conf)
+        self._notification_transport = get_notification_transport(conf)
+
+        self._aggregates = [
+            _AggregateExecutor(
+                conf,
+                scope,
+                self._rpc_transport,
+                self._notification_transport,
+            )
+            for scope in scopes
+        ]
+        self._labels = ", ".join(a.label for a in self._aggregates)
+
+        # Blocks start() until stop() is called.
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        """Start every aggregate unit. Blocks until stop is requested.
+
+        Cleanup runs from this method (the main thread) once the stop
+        event fires, not from the signal handler.  oslo.messaging
+        ``stop()``/``wait()`` take locks that aren't safe to acquire
+        from a signal-handler context, and a re-entrant signal during
+        cleanup can deadlock.
+        """
+        LOG.info("Starting executor for aggregates: %s", self._labels)
+        for aggregate in self._aggregates:
+            aggregate.start()
+        LOG.info(
+            "Executor ready; servicing %d aggregate(s): %s",
+            len(self._aggregates),
+            self._labels,
+        )
+        # Block here - oslo.messaging RPC servers consume in background threads.
+        self._stop_event.wait()
+        self._shutdown()
+
+    def request_stop(self) -> None:
+        """Async-signal-safe stop request.  Call from signal handlers."""
+        self._stop_event.set()
+
+    def stop(self) -> None:
+        """Synchronous stop: nudge the event and run cleanup inline.
+
+        Suitable for tests and any caller already on the main thread.
+        Signal handlers should call :meth:`request_stop` instead so
+        that cleanup runs from the daemon's main thread.
+        """
+        self._stop_event.set()
+        self._shutdown()
+
+    def _shutdown(self) -> None:
+        """Drain every aggregate unit in parallel with a hard-exit watchdog.
+
+        ``MessageHandlingServer.wait()`` has no timeout in oslo.messaging;
+        if a consumer thread doesn't unwind we run each unit's drain in
+        its own daemon thread and give up after a shared deadline so the
+        process actually exits.  Draining in parallel keeps a single
+        stuck aggregate from eating the whole budget before its siblings
+        get a chance to drain.
+        """
+        LOG.info("Stopping executor for aggregates: %s", self._labels)
+
+        drainers = [
+            threading.Thread(
+                target=aggregate.drain,
+                name=f"executor-shutdown-{aggregate.label}",
+                daemon=True,
+            )
+            for aggregate in self._aggregates
+        ]
+        for drainer in drainers:
+            drainer.start()
+
+        deadline = time.monotonic() + _SHUTDOWN_DEADLINE_SECONDS
+        for drainer in drainers:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                drainer.join(timeout=remaining)
+
+        if any(drainer.is_alive() for drainer in drainers):
+            LOG.warning(
+                "Executor shutdown did not complete within %.0fs; "
+                "exiting anyway.",
+                _SHUTDOWN_DEADLINE_SECONDS,
+            )
