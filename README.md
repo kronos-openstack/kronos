@@ -11,8 +11,6 @@ When dry-run is disabled, the engine casts migration tasks to a per-aggregate RP
 topic via oslo.messaging. A dedicated executor daemon consumes the tasks and carries
 them out through the Nova live-migrate API.
 
-> **Status:** Pre-alpha. Not yet ready for production.
-
 ## Features
 
 - **Combined multi-policy scoring** - every policy contributes a
@@ -484,17 +482,8 @@ enforcer, planner) so you can see where cycles are spent.
 
 ## Roadmap
 
-Planned work, in rough priority order:
+Planned work:
 
-- **Pack mode rework** - the current First Fit Decreasing drain order
-  is mechanically correct but the drain decisions need rethinking.
-  Once the semantics are right: put fully drained hosts into
-  maintenance, refuse to drain below a configurable spare-host
-  reserve, and bring drained hosts back when load grows.
-- **Soft affinity as planner penalties** - soft server-group rules
-  currently veto moves just like hard ones; they should become
-  weighted penalties so a mild soft-rule violation can still win when
-  it resolves a much larger imbalance.
 - **Richer constraints** - NUMA topology, CPU feature flags, and
   flavor extra specs as additional move filters.
 
