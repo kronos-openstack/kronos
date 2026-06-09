@@ -9,6 +9,19 @@ description = "PromQL-driven VM placement engine for OpenStack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.12"
+authors = [
+    {name = "Luca Del Monte", email = "luca.delmonte5@gmail.com"},
+    {name = "Michele Palazzi", email = "sysdadmin@m1k.cloud"},
+]
+keywords = [
+    "openstack",
+    "nova",
+    "prometheus",
+    "live-migration",
+    "scheduler",
+    "placement",
+    "rebalancing",
+]
 classifiers = [
     "Development Status :: 2 - Pre-Alpha",
     "Environment :: OpenStack",
@@ -42,7 +55,18 @@ dev = [
     "mypy>=1.10",
     "pyright==1.1.408",
     "tox>=4.15",
+    "build>=1.2",
 ]
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.1.29",
+]
+
+[project.urls]
+Homepage = "https://github.com/kronos-openstack/kronos"
+Repository = "https://github.com/kronos-openstack/kronos"
+Issues = "https://github.com/kronos-openstack/kronos/issues"
+Documentation = "https://kronos-openstack.readthedocs.io"
 
 [project.scripts]
 kronos-engine = "kronos.cmd.engine:main"
@@ -50,6 +74,9 @@ kronos-test-config = "kronos.cmd.test_config:main"
 kronos-executor = "kronos.cmd.executor:main"
 kronos-record = "kronos.cmd.record:main"
 kronos-replay = "kronos.cmd.replay:main"
+
+[project.entry-points."oslo.config.opts"]
+kronos = "kronos.common.config:list_opts"
 
 [tool.setuptools-scm]
 

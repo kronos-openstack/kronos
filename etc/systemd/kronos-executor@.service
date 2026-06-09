@@ -1,0 +1,39 @@
+# Instanced unit: the instance name is the Nova host aggregate this
+# executor services:
+#
+#   systemctl enable --now kronos-executor@gpu-aggregate.service
+#     -> kronos-executor --aggregate gpu-aggregate
+#
+# One executor process can also service several aggregates and/or the
+# unassigned-hosts pool (--aggregate is repeatable, plus --unassigned).
+# For that, write a non-instanced unit or a drop-in overriding
+# ExecStart instead of starting several instances.
+
+[Unit]
+Description=Kronos migration executor (%i)
+Documentation=https://github.com/kronos-openstack/kronos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kronos
+Group=kronos
+ExecStart=/usr/bin/kronos-executor --config-file /etc/kronos/kronos.conf --aggregate %i
+Restart=on-failure
+RestartSec=10
+# SIGTERM drains all aggregate units in parallel under a 15s watchdog;
+# Nova continues migrations it has already started.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening. The executor only needs network access plus read access
+# to /etc/kronos.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

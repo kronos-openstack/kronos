@@ -1,0 +1,55 @@
+name: Container
+
+# Builds the Kolla-style image (docker/Dockerfile) and pushes it to
+# GHCR. Tags: the git tag for releases, "main" for branch pushes; each
+# also gets a "-<kolla base tag>" suffixed variant so the OpenStack
+# release the image was built against is explicit.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  BASE_TAG: 2025.1-ubuntu-noble
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # setuptools-scm derives the version from git history
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      # The Dockerfile installs the wheel from dist/
+      - run: pip install build
+      - run: python -m build
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=branch,suffix=-${{ env.BASE_TAG }}
+            type=ref,event=tag,suffix=-${{ env.BASE_TAG }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          build-args: |
+            BASE_TAG=${{ env.BASE_TAG }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

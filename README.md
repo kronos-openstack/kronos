@@ -33,13 +33,13 @@ them out through the Nova live-migrate API.
               +------------+--------------+              |
                            |                             |
                   MigrationTask per step                 |
-                  RPC cast ───────────────────────────►  |
+                  RPC cast ----------------------------->|
                                                          |
-              +------------------------------------------v--+
-              |            kronos-executor                   |
-              |  consume → pre-flight → live-migrate → poll |
-              |  → post-flight → publish result             |
-              +---------------------------------------------+
+              +------------------------------------------v-----+
+              |                kronos-executor                 |
+              | consume -> pre-flight -> live-migrate -> poll  |
+              | -> post-flight -> publish result               |
+              +------------------------------------------------+
 ```
 
 1. **Policies** define PromQL queries, thresholds, and scheduling modes. All
@@ -382,12 +382,12 @@ The unassigned-hosts pool uses the reserved name `_unassigned_` in its topics.
 
 ```
 kronos/
-├── cmd/           CLI entry points (kronos-engine, kronos-executor, kronos-test-config, kronos-record, kronos-replay)
-├── common/        Shared utilities, exceptions, oslo.config registration, oslo.messaging helpers
-├── policies/      Pydantic models and YAML loader for policy definitions
-├── clients/       Prometheus HTTP client, Nova/OpenStack client (read + live-migrate)
-├── engine/        Control loop, scoring, profiling, constraint checking, affinity enforcement, planning, cooldown tracking
-└── executor/      Migration executor: worker, scheduler, migration runner
++-- cmd/           CLI entry points (kronos-engine, kronos-executor, kronos-test-config, kronos-record, kronos-replay)
++-- common/        Shared utilities, exceptions, oslo.config registration, oslo.messaging helpers
++-- policies/      Pydantic models and YAML loader for policy definitions
++-- clients/       Prometheus HTTP client, Nova/OpenStack client (read + live-migrate)
++-- engine/        Control loop, scoring, profiling, constraint checking, affinity enforcement, planning, cooldown tracking
++-- executor/      Migration executor: worker, scheduler, migration runner
 
 tools/             Operational helpers (e.g. generate_fake_snapshot.py for benchmarks)
 ```
@@ -406,7 +406,32 @@ ruff check kronos/ tests/
 # Type check (both must pass)
 mypy kronos/
 pyright kronos/ tests/
+
+# Build the docs
+pip install -e ".[docs]"
+sphinx-build -W -b html docs docs/_build/html
+
+# Regenerate the full config reference after changing options
+oslo-config-generator --config-file etc/oslo-config-generator/kronos.conf
 ```
+
+## Deployment
+
+Full guides live in `docs/` (installation, systemd, containers,
+operator runbook). In short:
+
+- **PyPI**: `pip install kronos-openstack` installs all five
+  binaries. Validate configs with `kronos-test-config` before
+  starting anything.
+- **systemd**: instanced units in `etc/systemd/`. One
+  `kronos-engine@<name>` per availability zone (reads
+  `/etc/kronos/kronos-<name>.conf`), one `kronos-executor@<aggregate>`
+  per aggregate.
+- **Container**: `docker/Dockerfile` builds a Kolla-style image on
+  top of `quay.io/openstack.kolla/openstack-base`, so it deploys like
+  any other OpenStack service container (config and command injected
+  via `config.json`; examples in `etc/kolla/`). One image serves both
+  daemons.
 
 ## Benchmarks
 
@@ -439,7 +464,7 @@ enforcer, planner) so you can see where cycles are spent.
 | **M6** | AZ scope: the engine is bound to one availability zone (`[engine] availability_zone`, default `nova`); hosts in any other zone are filtered out of every aggregate. Cross-AZ migrations cannot occur. Deploy one engine per AZ. | Done |
 | **M7** | Replay reuses the engine: dependency-inject Nova/Prometheus clients and the cooldown tracker into `EngineLoop`, expose a public `run_once()`, and shrink `kronos-replay` to a thin wrapper. Snapshot format gets a host->zone map so the AZ filter still applies; `--time` becomes an opt-in timing hook on the engine itself. | Done |
 | **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Done |
-| **M9** | PyPI packaging, container image, systemd units, documentation | Planned |
+| **M9** | PyPI packaging, container image, systemd units, documentation | Done |
 
 ## License
 

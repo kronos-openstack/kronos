@@ -1,0 +1,5 @@
+# Keep the build context small: the image only COPYs dist/ and etc/.
+*
+!dist
+!etc
+dist/*.tar.gz

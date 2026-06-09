@@ -1,0 +1,42 @@
+# Instanced unit: one engine per scope (typically one per availability
+# zone). The instance name selects the config file:
+#
+#   systemctl enable --now kronos-engine@default.service
+#     -> reads /etc/kronos/kronos-default.conf
+#
+#   systemctl enable --now kronos-engine@az2.service
+#     -> reads /etc/kronos/kronos-az2.conf
+#
+# Send SIGUSR1 for an on-demand snapshot (requires [engine] snapshot_dir):
+#
+#   systemctl kill -s SIGUSR1 kronos-engine@default.service
+
+[Unit]
+Description=Kronos placement engine (%i)
+Documentation=https://github.com/kronos-openstack/kronos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kronos
+Group=kronos
+ExecStart=/usr/bin/kronos-engine --config-file /etc/kronos/kronos-%i.conf
+Restart=on-failure
+RestartSec=10
+# SIGTERM triggers graceful shutdown (drains result listeners).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening. The engine only needs network access plus read access to
+# /etc/kronos and write access to the snapshot directory (when
+# configured). Add that directory to ReadWritePaths in a drop-in if
+# you enable [engine] snapshot_dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target

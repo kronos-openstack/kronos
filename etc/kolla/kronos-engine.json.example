@@ -1,0 +1,17 @@
+{
+    "command": "kronos-engine --config-file /etc/kronos/kronos.conf",
+    "config_files": [
+        {
+            "source": "/var/lib/kolla/config_files/kronos.conf",
+            "dest": "/etc/kronos/kronos.conf",
+            "owner": "kronos",
+            "perm": "0600"
+        },
+        {
+            "source": "/var/lib/kolla/config_files/policies.yaml",
+            "dest": "/etc/kronos/policies.yaml",
+            "owner": "kronos",
+            "perm": "0600"
+        }
+    ]
+}
