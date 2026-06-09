@@ -53,6 +53,7 @@ dev = [
     "responses>=0.25",
     "ruff>=0.4",
     "mypy>=1.10",
+    "types-PyYAML",
     "pyright==1.1.408",
     "tox>=4.15",
     "build>=1.2",
@@ -78,7 +79,7 @@ kronos-replay = "kronos.cmd.replay:main"
 [project.entry-points."oslo.config.opts"]
 kronos = "kronos.common.config:list_opts"
 
-[tool.setuptools-scm]
+[tool.setuptools_scm]
 
 [tool.setuptools.packages.find]
 include = ["kronos*"]
