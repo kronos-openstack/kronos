@@ -13,6 +13,36 @@ them out through the Nova live-migrate API.
 
 > **Status:** Pre-alpha. Not yet ready for production.
 
+## Features
+
+- **Combined multi-policy scoring** - every policy contributes a
+  weighted PromQL-driven imbalance score; one simulation plans across
+  all dimensions at once instead of fighting itself one metric at a
+  time.
+- **Spread and pack modes** - balance load across hosts, or
+  consolidate onto as few hosts as possible with per-policy capacity
+  ceilings.
+- **Server-group awareness** - all four Nova placement policies
+  (affinity, anti-affinity, and their soft variants, including the
+  `max_server_per_host` rule) both constrain new plans and get
+  actively repaired by an optional enforcement pass.
+- **Disabled-host evacuation** - optionally drain VMs off
+  administratively disabled (but still up) compute hosts before any
+  rebalancing happens.
+- **Safety rails everywhere** - dry-run mode, per-cycle migration
+  budgets, host liveness gate on Nova `os-services`, Placement claims
+  gate (both fail closed), aggregate and instance cooldowns, and
+  automatic quarantine of VMs whose migrations definitively fail.
+- **Availability-zone scoping** - each engine is bound to one AZ;
+  cross-AZ migrations cannot be planned by construction.
+- **Record and replay** - snapshot a live cluster (on demand via
+  SIGUSR1, or with `kronos-record`) and re-run the full planning
+  pipeline offline against it, including seeded cooldown state and
+  per-phase timings.
+- **Operator-grade packaging** - PyPI wheels, a Kolla-style container
+  image that drops into Kolla-Ansible deployments, hardened systemd
+  units, a generated config reference, and an operator runbook.
+
 ## How It Works
 
 ```
@@ -454,17 +484,21 @@ enforcer, planner) so you can see where cycles are spent.
 
 ## Roadmap
 
-| Milestone | Scope | Status |
-|-----------|-------|--------|
-| **M1** | Project skeleton, oslo.config, clients, dry-run engine loop | Done |
-| **M2** | VM profiling, simulation-based migration planning, constraint checking, record/replay | Done |
-| **M3** | oslo.messaging queue, migration executor, cooldown tracking | Done |
-| **M4** | Affinity enforcer, all four server-group policies, phase-tagged steps, planner perf, benchmarks | Done |
-| **M5** | Pre-migration host: nova-compute service liveness on source and destination, evacuator for admin-disabled hosts. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly. | Done |
-| **M6** | AZ scope: the engine is bound to one availability zone (`[engine] availability_zone`, default `nova`); hosts in any other zone are filtered out of every aggregate. Cross-AZ migrations cannot occur. Deploy one engine per AZ. | Done |
-| **M7** | Replay reuses the engine: dependency-inject Nova/Prometheus clients and the cooldown tracker into `EngineLoop`, expose a public `run_once()`, and shrink `kronos-replay` to a thin wrapper. Snapshot format gets a host->zone map so the AZ filter still applies; `--time` becomes an opt-in timing hook on the engine itself. | Done |
-| **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Done |
-| **M9** | PyPI packaging, container image, systemd units, documentation | Done |
+Planned work, in rough priority order:
+
+- **Pack mode rework** - the current First Fit Decreasing drain order
+  is mechanically correct but the drain decisions need rethinking.
+  Once the semantics are right: put fully drained hosts into
+  maintenance, refuse to drain below a configurable spare-host
+  reserve, and bring drained hosts back when load grows.
+- **Soft affinity as planner penalties** - soft server-group rules
+  currently veto moves just like hard ones; they should become
+  weighted penalties so a mild soft-rule violation can still win when
+  it resolves a much larger imbalance.
+- **Richer constraints** - NUMA topology, CPU feature flags, and
+  flavor extra specs as additional move filters.
+
+Suggestions and contributions are welcome - open an issue.
 
 ## License
 
