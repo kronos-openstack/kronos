@@ -60,4 +60,15 @@ jobs:
         with:
           inputs: dist/*.tar.gz dist/*.whl
           upload-signing-artifacts: true
-          release-signing-artifacts: true
+      # The sigstore action only attaches files to a release that
+      # already exists, so create the release here with the dist files
+      # and the .sigstore.json bundles the previous step wrote.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Kronos ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            dist/*.tar.gz dist/*.whl dist/*.sigstore.json
