@@ -206,7 +206,7 @@ class PrometheusClient:
     def _query_with_retry(self, query: str) -> dict[str, Any]:
         """Execute query with retry logic."""
 
-        @retry(  # type: ignore[untyped-decorator]
+        @retry(  # type: ignore[untyped-decorator]  # tenacity ships no stubs
             retry=retry_if_exception_type(requests.ConnectionError),
             stop=stop_after_attempt(self._max_retries + 1),
             wait=wait_exponential(multiplier=self._retry_backoff, max=30),
@@ -235,7 +235,6 @@ class PrometheusClient:
                 params={"query": query},
                 timeout=self._timeout,
             )
-            resp.raise_for_status()
         except requests.ConnectionError:
             raise
         except requests.Timeout as exc:
@@ -243,6 +242,9 @@ class PrometheusClient:
                 url=self._base_url,
                 reason=f"Timeout after {self._timeout}s",
             ) from exc
+
+        try:
+            resp.raise_for_status()
         except requests.HTTPError as exc:
             raise PrometheusQueryError(
                 reason=f"HTTP {resp.status_code}: {resp.text[:200]}"

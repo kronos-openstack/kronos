@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,8 +22,8 @@ def _all_up_services(*hosts: str) -> list[ComputeService]:
     ]
 
 
-def _make_task(**overrides: object) -> MigrationTask:
-    defaults: dict[str, object] = {
+def _make_task(**overrides: Any) -> MigrationTask:
+    defaults: dict[str, Any] = {
         "task_id": "task-123",
         "plan_id": "plan-456",
         "aggregate": "test-agg",

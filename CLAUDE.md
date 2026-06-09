@@ -108,7 +108,7 @@ call `logging.getLogger(__name__)`.
 - Pydantic v2 for policy YAML validation only (NOT for daemon config)
 - Dataclasses for internal data types (HostScore, PolicyResult, etc.) - NOT frozen, for testability
 - No global mutable state - dependency injection via constructors
-- Ruff for linting (`ruff check`), mypy strict mode
+- Ruff for linting (`ruff check`), mypy strict mode, pyright basic mode
 - Tests: pytest, mocked HTTP via `responses` library, mocked openstacksdk
 
 ## Package Layout (follows Nova/Neutron pattern)
@@ -158,7 +158,16 @@ pip install -e ".[dev]"
 pytest tests/
 ruff check kronos/ tests/
 mypy kronos/
+pyright kronos/ tests/
 ```
+
+Both type checkers must pass: mypy in strict mode (config in
+`[tool.mypy]`), pyright in basic mode plus selected strict rules
+(config in `[tool.pyright]`). Pyright basic matches what VSCode's
+Pylance surfaces by default, so a clean run means a clean problems
+panel on a fresh checkout. Strict mode is intentionally not enforced
+for pyright: the OpenStack dependencies ship no type stubs and strict
+drowns in reportUnknown* noise no annotation on our side can fix.
 
 ---
 

@@ -289,6 +289,8 @@ def main() -> int:
 
     engine = EngineLoop(
         CONF,
+        # Replay stand-ins are duck-typed: EngineLoop only calls the
+        # read methods both clients implement against snapshot data.
         nova=nova,  # type: ignore[arg-type]
         prometheus=prometheus,  # type: ignore[arg-type]
         cooldown=cooldown,

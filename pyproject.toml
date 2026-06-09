@@ -40,6 +40,7 @@ dev = [
     "responses>=0.25",
     "ruff>=0.4",
     "mypy>=1.10",
+    "pyright==1.1.408",
     "tox>=4.15",
 ]
 
@@ -80,6 +81,29 @@ module = [
 ]
 ignore_missing_imports = true
 follow_imports = "skip"
+
+[tool.pyright]
+include = ["kronos", "tests"]
+pythonVersion = "3.12"
+# "basic" rather than "strict": the OpenStack dependencies (oslo.*,
+# openstacksdk, keystoneauth1) ship no type stubs, so strict mode
+# drowns in reportUnknown* cascades that no annotation on our side can
+# fix. mypy --strict covers the strictness budget; pyright covers the
+# checks mypy misses. Selected strict-mode rules with real signal are
+# enabled individually below.
+typeCheckingMode = "basic"
+# oslo.*, openstacksdk, keystoneauth1, etc. ship no type stubs; mypy
+# already runs with ignore_missing_imports for them (see overrides
+# above). Mirror that here instead of per-line ignores.
+reportMissingModuleSource = false
+reportUnusedImport = "error"
+reportUnusedVariable = "error"
+reportUnusedClass = "error"
+reportUnusedFunction = "error"
+reportDuplicateImport = "error"
+reportUnnecessaryCast = "error"
+reportUnnecessaryContains = "error"
+reportUnnecessaryComparison = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

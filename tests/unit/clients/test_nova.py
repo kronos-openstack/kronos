@@ -16,6 +16,17 @@ from kronos.clients.nova import (
 from kronos.common.exceptions import AggregateNotFound, NovaClientError
 
 
+def _conn_mock(client: NovaClient) -> MagicMock:
+    """Return the client's mocked openstacksdk connection.
+
+    The fixture patches the Connection class, so ``client._conn`` is a
+    MagicMock at runtime; the assert restores that type statically.
+    """
+    conn = client._conn
+    assert isinstance(conn, MagicMock)
+    return conn
+
+
 def _make_mock_aggregate(name="test-agg", agg_id=1, hosts=None, metadata=None):
     agg = MagicMock()
     agg.id = agg_id
@@ -79,14 +90,11 @@ def mock_nova_client():
         mock_ks.load_auth_from_conf_options.return_value = mock_auth
         mock_ks.load_session_from_conf_options.return_value = mock_session
 
-        with patch("kronos.clients.nova.openstack.connection.Connection") as mock_conn_cls:
-            mock_conn = MagicMock()
-            mock_conn_cls.return_value = mock_conn
+        with patch("kronos.clients.nova.os_connection.Connection") as mock_conn_cls:
+            mock_conn_cls.return_value = MagicMock()
 
             conf = MagicMock()
-            client = NovaClient(conf)
-            client._mock_conn = mock_conn
-            yield client
+            yield NovaClient(conf)
 
 
 class TestNovaClientInit:
@@ -99,11 +107,11 @@ class TestNovaClientInit:
 
 class TestVerifyConnection:
     def test_success(self, mock_nova_client):
-        mock_nova_client._mock_conn.authorize.return_value = None
+        _conn_mock(mock_nova_client).authorize.return_value = None
         assert mock_nova_client.verify_connection() is True
 
     def test_failure(self, mock_nova_client):
-        mock_nova_client._mock_conn.authorize.side_effect = Exception("unauthorized")
+        _conn_mock(mock_nova_client).authorize.side_effect = Exception("unauthorized")
         with pytest.raises(NovaClientError, match="Authentication failed"):
             mock_nova_client.verify_connection()
 
@@ -111,7 +119,7 @@ class TestVerifyConnection:
 class TestListAggregates:
     def test_returns_aggregates(self, mock_nova_client):
         mock_agg = _make_mock_aggregate(name="gpu-agg", hosts=["h1", "h2"])
-        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = [mock_agg]
 
         result = mock_nova_client.list_aggregates()
 
@@ -121,11 +129,11 @@ class TestListAggregates:
         assert result[0].hosts == ["h1", "h2"]
 
     def test_empty_list(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.aggregates.return_value = []
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = []
         assert mock_nova_client.list_aggregates() == []
 
     def test_api_error(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.aggregates.side_effect = Exception("API down")
+        _conn_mock(mock_nova_client).compute.aggregates.side_effect = Exception("API down")
         with pytest.raises(NovaClientError, match="Failed to list aggregates"):
             mock_nova_client.list_aggregates()
 
@@ -133,13 +141,13 @@ class TestListAggregates:
 class TestGetAggregate:
     def test_found(self, mock_nova_client):
         mock_agg = _make_mock_aggregate(name="target")
-        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = [mock_agg]
 
         result = mock_nova_client.get_aggregate("target")
         assert result.name == "target"
 
     def test_not_found(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.aggregates.return_value = []
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = []
         with pytest.raises(AggregateNotFound, match="not found"):
             mock_nova_client.get_aggregate("nonexistent")
 
@@ -147,7 +155,7 @@ class TestGetAggregate:
 class TestGetHostsInAggregate:
     def test_returns_host_list(self, mock_nova_client):
         mock_agg = _make_mock_aggregate(hosts=["h1", "h2", "h3"])
-        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = [mock_agg]
 
         hosts = mock_nova_client.get_hosts_in_aggregate("test-agg")
         assert hosts == ["h1", "h2", "h3"]
@@ -155,11 +163,11 @@ class TestGetHostsInAggregate:
     def test_none_returns_unassigned(self, mock_nova_client):
         # One aggregate contains h1 only; h2 is unassigned
         mock_agg = _make_mock_aggregate(hosts=["h1"])
-        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = [mock_agg]
 
         hv1 = _make_mock_hypervisor(name="h1")
         hv2 = _make_mock_hypervisor(name="h2")
-        mock_nova_client._mock_conn.compute.hypervisors.return_value = [hv1, hv2]
+        _conn_mock(mock_nova_client).compute.hypervisors.return_value = [hv1, hv2]
 
         hosts = mock_nova_client.get_hosts_in_aggregate(None)
         assert hosts == ["h2"]
@@ -169,7 +177,7 @@ class TestListComputeHosts:
     def test_all_hosts(self, mock_nova_client):
         hv1 = _make_mock_hypervisor(name="h1")
         hv2 = _make_mock_hypervisor(name="h2")
-        mock_nova_client._mock_conn.compute.hypervisors.return_value = [hv1, hv2]
+        _conn_mock(mock_nova_client).compute.hypervisors.return_value = [hv1, hv2]
 
         result = mock_nova_client.list_compute_hosts()
         assert len(result) == 2
@@ -179,10 +187,10 @@ class TestListComputeHosts:
         hv1 = _make_mock_hypervisor(name="h1")
         hv2 = _make_mock_hypervisor(name="h2")
         hv3 = _make_mock_hypervisor(name="h3")
-        mock_nova_client._mock_conn.compute.hypervisors.return_value = [hv1, hv2, hv3]
+        _conn_mock(mock_nova_client).compute.hypervisors.return_value = [hv1, hv2, hv3]
 
         mock_agg = _make_mock_aggregate(hosts=["h1", "h3"])
-        mock_nova_client._mock_conn.compute.aggregates.return_value = [mock_agg]
+        _conn_mock(mock_nova_client).compute.aggregates.return_value = [mock_agg]
 
         result = mock_nova_client.list_compute_hosts(aggregate_name="test-agg")
         names = [h.name for h in result]
@@ -191,7 +199,7 @@ class TestListComputeHosts:
         assert "h2" not in names
 
     def test_api_error(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.hypervisors.side_effect = Exception("fail")
+        _conn_mock(mock_nova_client).compute.hypervisors.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list hypervisors"):
             mock_nova_client.list_compute_hosts()
 
@@ -200,7 +208,7 @@ class TestListInstancesOnHost:
     def test_returns_instances(self, mock_nova_client):
         s1 = _make_mock_server(server_id="u1", name="vm-1")
         s2 = _make_mock_server(server_id="u2", name="vm-2")
-        mock_nova_client._mock_conn.compute.servers.return_value = [s1, s2]
+        _conn_mock(mock_nova_client).compute.servers.return_value = [s1, s2]
 
         result = mock_nova_client.list_instances_on_host("compute-01")
         assert len(result) == 2
@@ -209,12 +217,12 @@ class TestListInstancesOnHost:
         assert result[0].name == "vm-1"
 
     def test_empty_host(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.servers.return_value = []
+        _conn_mock(mock_nova_client).compute.servers.return_value = []
         result = mock_nova_client.list_instances_on_host("empty-host")
         assert result == []
 
     def test_api_error(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.servers.side_effect = Exception("fail")
+        _conn_mock(mock_nova_client).compute.servers.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list instances"):
             mock_nova_client.list_instances_on_host("compute-01")
 
@@ -228,7 +236,7 @@ class TestListServerGroups:
         group.policies = ["anti-affinity"]
         group.policy = None
         group.member_ids = ["uuid-1", "uuid-2"]
-        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+        _conn_mock(mock_nova_client).compute.server_groups.return_value = [group]
 
         result = mock_nova_client.list_server_groups()
         assert len(result) == 1
@@ -244,7 +252,7 @@ class TestListServerGroups:
         group.policies = None
         group.policy = "soft-anti-affinity"
         group.member_ids = ["uuid-3"]
-        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+        _conn_mock(mock_nova_client).compute.server_groups.return_value = [group]
 
         result = mock_nova_client.list_server_groups()
         assert result[0]["policies"] == ["soft-anti-affinity"]
@@ -257,7 +265,7 @@ class TestListServerGroups:
         group.policies = ["anti-affinity"]
         group.policy = "anti-affinity"
         group.member_ids = []
-        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+        _conn_mock(mock_nova_client).compute.server_groups.return_value = [group]
 
         result = mock_nova_client.list_server_groups()
         assert result[0]["policies"] == ["anti-affinity"]
@@ -271,7 +279,7 @@ class TestListServerGroups:
         group.policy = None
         group.member_ids = ["uuid-1"]
         group.rules = {"max_server_per_host": 3}
-        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+        _conn_mock(mock_nova_client).compute.server_groups.return_value = [group]
 
         result = mock_nova_client.list_server_groups()
         assert result[0]["rules"] == {"max_server_per_host": 3}
@@ -285,13 +293,13 @@ class TestListServerGroups:
         group.policy = None
         group.member_ids = ["uuid-1"]
         group.rules = None
-        mock_nova_client._mock_conn.compute.server_groups.return_value = [group]
+        _conn_mock(mock_nova_client).compute.server_groups.return_value = [group]
 
         result = mock_nova_client.list_server_groups()
         assert result[0]["rules"] == {}
 
     def test_api_error(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.server_groups.side_effect = Exception("fail")
+        _conn_mock(mock_nova_client).compute.server_groups.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list server groups"):
             mock_nova_client.list_server_groups()
 
@@ -325,7 +333,7 @@ class TestListComputeServices:
             _make_mock_service(host="h3", binary="nova-compute"),
             _make_mock_service(host="h4", binary="nova-scheduler"),
         ]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
 
@@ -336,7 +344,7 @@ class TestListComputeServices:
     def test_normalises_state_and_status_to_lowercase(self, mock_nova_client):
         """Some Nova versions return upper-case enum values; lowercase them."""
         services = [_make_mock_service(state="UP", status="ENABLED")]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
 
@@ -346,7 +354,7 @@ class TestListComputeServices:
 
     def test_disabled_host_not_available_destination(self, mock_nova_client):
         services = [_make_mock_service(state="up", status="disabled")]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
         assert result[0].is_up is True
@@ -355,7 +363,7 @@ class TestListComputeServices:
 
     def test_down_host_not_available_destination(self, mock_nova_client):
         services = [_make_mock_service(state="down", status="enabled")]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
         assert result[0].is_up is False
@@ -367,7 +375,7 @@ class TestListComputeServices:
         services = [
             _make_mock_service(state="up", status="enabled", forced_down=True),
         ]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
         assert result[0].forced_down is True
@@ -378,7 +386,7 @@ class TestListComputeServices:
             _make_mock_service(host="h1", availability_zone="nova"),
             _make_mock_service(host="h2", availability_zone="dmz"),
         ]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
         zones = {s.host: s.zone for s in result}
@@ -388,7 +396,7 @@ class TestListComputeServices:
         self, mock_nova_client, caplog,
     ):
         services = [_make_mock_service(host="h1", availability_zone="")]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         with caplog.at_level("WARNING"):
             result = mock_nova_client.list_compute_services()
@@ -405,16 +413,16 @@ class TestListComputeServices:
                 state="up", status="disabled", disabled_reason="maintenance",
             ),
         ]
-        mock_nova_client._mock_conn.compute.services.return_value = services
+        _conn_mock(mock_nova_client).compute.services.return_value = services
 
         result = mock_nova_client.list_compute_services()
         assert result[0].disabled_reason == "maintenance"
 
     def test_empty_list(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.services.return_value = []
+        _conn_mock(mock_nova_client).compute.services.return_value = []
         assert mock_nova_client.list_compute_services() == []
 
     def test_api_error(self, mock_nova_client):
-        mock_nova_client._mock_conn.compute.services.side_effect = Exception("fail")
+        _conn_mock(mock_nova_client).compute.services.side_effect = Exception("fail")
         with pytest.raises(NovaClientError, match="Failed to list compute services"):
             mock_nova_client.list_compute_services()

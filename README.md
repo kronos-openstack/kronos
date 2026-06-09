@@ -403,8 +403,9 @@ pytest
 # Lint
 ruff check kronos/ tests/
 
-# Type check
+# Type check (both must pass)
 mypy kronos/
+pyright kronos/ tests/
 ```
 
 ## Benchmarks
@@ -437,7 +438,7 @@ enforcer, planner) so you can see where cycles are spent.
 | **M5** | Pre-migration host: nova-compute service liveness on source and destination, evacuator for admin-disabled hosts. Storage is intentionally not validated - Nova's `block_migration='auto'` already decides correctly. | Done |
 | **M6** | AZ scope: the engine is bound to one availability zone (`[engine] availability_zone`, default `nova`); hosts in any other zone are filtered out of every aggregate. Cross-AZ migrations cannot occur. Deploy one engine per AZ. | Done |
 | **M7** | Replay reuses the engine: dependency-inject Nova/Prometheus clients and the cooldown tracker into `EngineLoop`, expose a public `run_once()`, and shrink `kronos-replay` to a thin wrapper. Snapshot format gets a host->zone map so the AZ filter still applies; `--time` becomes an opt-in timing hook on the engine itself. | Done |
-| **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Planned |
+| **M8** | Project-wide code-quality cleanup: (Pyright/Pylance warnings, unused imports, dead code, unresolved refs, type-annotation inconsistencies that mypy strict mode doesn't catch) | Done |
 | **M9** | PyPI packaging, container image, systemd units, documentation | Planned |
 
 ## License

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,22 +28,22 @@ def invalid_policies_path() -> Path:
 
 
 @pytest.fixture()
-def prometheus_healthy_response() -> dict:
+def prometheus_healthy_response() -> dict[str, Any]:
     return json.loads((PROMETHEUS_FIXTURES_DIR / "healthy.json").read_text())
 
 
 @pytest.fixture()
-def prometheus_stale_response() -> dict:
+def prometheus_stale_response() -> dict[str, Any]:
     return json.loads((PROMETHEUS_FIXTURES_DIR / "stale.json").read_text())
 
 
 @pytest.fixture()
-def prometheus_partial_response() -> dict:
+def prometheus_partial_response() -> dict[str, Any]:
     return json.loads((PROMETHEUS_FIXTURES_DIR / "partial.json").read_text())
 
 
 @pytest.fixture()
-def sample_policy_dict() -> dict:
+def sample_policy_dict() -> dict[str, Any]:
     """Minimal valid policy dict for unit tests."""
     return {
         "name": "test-policy",
@@ -54,7 +55,7 @@ def sample_policy_dict() -> dict:
 
 
 @pytest.fixture()
-def sample_pack_policy_dict() -> dict:
+def sample_pack_policy_dict() -> dict[str, Any]:
     """Valid pack-mode policy dict."""
     return {
         "name": "test-pack-policy",

@@ -25,8 +25,10 @@ and ``placement:resource_providers:inventories:list`` /
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from keystoneauth1 import loading as ks_loading
+from openstack import connection as os_connection
 from oslo_config import cfg
 from oslo_log import log as logging
 
@@ -102,16 +104,23 @@ class PlacementClient:
             NOVA_GROUP,
         )
         try:
-            import openstack
             auth = ks_loading.load_auth_from_conf_options(conf, NOVA_GROUP)
             session = ks_loading.load_session_from_conf_options(
                 conf, NOVA_GROUP, auth=auth,
             )
-            self._conn = openstack.connection.Connection(session=session)
+            self._conn = os_connection.Connection(session=session)
         except Exception as exc:
             raise PlacementClientError(
                 reason=f"Failed to connect: {exc}",
             ) from exc
+
+    @property
+    def _placement(self) -> Any:
+        # openstacksdk exposes services as class-level ServiceDescription
+        # descriptors that materialize a Proxy at runtime; static checkers
+        # cannot follow that, so narrow to Any once here instead of
+        # per-call ignores.
+        return self._conn.placement
 
     def fetch_snapshots(self) -> dict[str, ProviderSnapshot]:
         """Return one ``ProviderSnapshot`` per compute resource provider.
@@ -129,7 +138,7 @@ class PlacementClient:
             provider doesn't pause planning cluster-wide.
         """
         try:
-            providers = list(self._conn.placement.resource_providers())
+            providers = list(self._placement.resource_providers())
         except Exception as exc:
             raise PlacementClientError(
                 reason=f"Failed to list resource providers: {exc}",
@@ -167,7 +176,7 @@ class PlacementClient:
 
     def _fetch_inventories(self, rp_id: str) -> dict[str, ResourceInventory]:
         result: dict[str, ResourceInventory] = {}
-        for inv in self._conn.placement.resource_provider_inventories(rp_id):
+        for inv in self._placement.resource_provider_inventories(rp_id):
             rc = str(getattr(inv, "resource_class", "") or "")
             if rc not in TRACKED_RESOURCE_CLASSES:
                 continue
@@ -188,7 +197,7 @@ class PlacementClient:
         # binding for the per-provider usages endpoint, so we hit the
         # raw REST route (GET /resource_providers/{uuid}/usages).  The
         # response shape is {"usages": {"VCPU": n, "MEMORY_MB": n, ...}}.
-        resp = self._conn.placement.get(f"/resource_providers/{rp_id}/usages")
+        resp = self._placement.get(f"/resource_providers/{rp_id}/usages")
         resp.raise_for_status()
         body = resp.json() or {}
         raw = body.get("usages") or {}

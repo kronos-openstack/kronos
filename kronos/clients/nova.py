@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from typing import Any
 
-import openstack
 from keystoneauth1 import loading as ks_loading
+from openstack import connection as os_connection
 from openstack import exceptions as os_exc
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -188,9 +189,17 @@ class NovaClient:
             requests_session = getattr(session, "session", None)
             if requests_session is not None:
                 requests_session.headers["Connection"] = "close"
-            self._conn = openstack.connection.Connection(session=session)
+            self._conn = os_connection.Connection(session=session)
         except Exception as exc:
             raise NovaClientError(reason=f"Failed to connect: {exc}") from exc
+
+    @property
+    def _compute(self) -> Any:
+        # openstacksdk exposes services as class-level ServiceDescription
+        # descriptors that materialize a Proxy at runtime; static checkers
+        # cannot follow that, so narrow to Any once here instead of
+        # per-call ignores.
+        return self._conn.compute
 
     def verify_connection(self) -> bool:
         """Verify Keystone authentication works.
@@ -213,7 +222,7 @@ class NovaClient:
         :returns: List of HostAggregate instances.
         """
         try:
-            aggregates = self._conn.compute.aggregates()
+            aggregates = self._compute.aggregates()
             return [
                 HostAggregate(
                     id=agg.id,
@@ -267,7 +276,7 @@ class NovaClient:
         :returns: List of ComputeHost instances.
         """
         try:
-            hypervisors = list(self._conn.compute.hypervisors(details=True))
+            hypervisors = list(self._compute.hypervisors(details=True))
         except Exception as exc:
             raise NovaClientError(
                 reason=f"Failed to list hypervisors: {exc}"
@@ -305,7 +314,7 @@ class NovaClient:
         """
         try:
             servers = list(
-                self._conn.compute.servers(
+                self._compute.servers(
                     details=True,
                     all_projects=True,
                     compute_host=host,
@@ -347,7 +356,7 @@ class NovaClient:
         :raises NovaClientError: If the API call fails.
         """
         try:
-            services = list(self._conn.compute.services())
+            services = list(self._compute.services())
         except Exception as exc:
             raise NovaClientError(
                 reason=f"Failed to list compute services: {exc}"
@@ -399,7 +408,7 @@ class NovaClient:
             members, rules.
         """
         try:
-            groups = list(self._conn.compute.server_groups(all_projects=True))
+            groups = list(self._compute.server_groups(all_projects=True))
         except Exception as exc:
             raise NovaClientError(
                 reason=f"Failed to list server groups: {exc}"
@@ -441,7 +450,7 @@ class NovaClient:
         :raises NovaClientError: If the API call fails.
         """
         try:
-            server = self._conn.compute.get_server(instance_uuid)
+            server = self._compute.get_server(instance_uuid)
             return server.status, getattr(server, "task_state", None)
         except Exception as exc:
             raise NovaClientError(
@@ -456,7 +465,7 @@ class NovaClient:
         :raises NovaClientError: If the API call fails.
         """
         try:
-            server = self._conn.compute.get_server(instance_uuid)
+            server = self._compute.get_server(instance_uuid)
             return getattr(server, "hypervisor_hostname", "") or ""
         except Exception as exc:
             raise NovaClientError(
@@ -477,7 +486,7 @@ class NovaClient:
         :raises NovaClientError: If the API call fails.
         """
         try:
-            self._conn.compute.live_migrate_server(
+            self._compute.live_migrate_server(
                 instance_uuid,
                 host=dest_host,
                 block_migration=block_migration,
@@ -509,7 +518,7 @@ class NovaClient:
         """
         try:
             migrations = list(
-                self._conn.compute.server_migrations(instance_uuid),
+                self._compute.server_migrations(instance_uuid),
             )
         except Exception as exc:
             raise NovaClientError(

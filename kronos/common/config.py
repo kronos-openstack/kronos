@@ -8,7 +8,7 @@ project_name, etc. under the ``[nova]`` config group.
 from keystoneauth1 import loading as ks_loading
 from oslo_config import cfg
 
-messaging_opts = [
+messaging_opts: list[cfg.Opt] = [
     cfg.StrOpt(
         "transport",
         default="rabbit",
@@ -40,7 +40,7 @@ messaging_opts = [
     ),
 ]
 
-executor_opts = [
+executor_opts: list[cfg.Opt] = [
     cfg.IntOpt(
         "max_concurrent_migrations",
         default=2,
@@ -80,7 +80,7 @@ executor_opts = [
     ),
 ]
 
-engine_opts = [
+engine_opts: list[cfg.Opt] = [
     cfg.IntOpt(
         "evaluation_interval",
         default=60,
@@ -252,7 +252,7 @@ engine_opts = [
     ),
 ]
 
-prometheus_opts = [
+prometheus_opts: list[cfg.Opt] = [
     cfg.URIOpt(
         "url",
         schemes=["http", "https"],

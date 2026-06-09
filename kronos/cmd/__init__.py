@@ -3,4 +3,6 @@ import warnings
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    import eventlet  # noqa: F401
+    # Side-effect import: pull eventlet in early (oslo.messaging picks
+    # it up at import time) with its deprecation warnings silenced.
+    import eventlet  # noqa: F401  # pyright: ignore[reportUnusedImport]

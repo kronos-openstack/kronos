@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -17,8 +18,8 @@ from kronos.engine.types import HostScore, MigrationPlan, PolicyResult, VmProfil
 from kronos.policies.models import PolicyConfig, PolicyMode
 
 
-def _make_policy(**overrides: object) -> PolicyConfig:
-    defaults: dict[str, object] = {
+def _make_policy(**overrides: Any) -> PolicyConfig:
+    defaults: dict[str, Any] = {
         "name": "test-policy",
         "mode": "spread",
         "weight": 1.0,

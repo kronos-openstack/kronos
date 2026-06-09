@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from unittest.mock import MagicMock
 
 import pytest
@@ -10,7 +11,7 @@ from kronos.clients.nova import ComputeService
 from kronos.engine.constraints import ConstraintChecker
 from kronos.engine.evacuator import Evacuator
 from kronos.engine.types import MigrationPhase, VmProfile
-from kronos.policies.models import PolicyConfig
+from kronos.policies.models import PolicyConfig, PolicyMode
 
 
 def _policy(
@@ -20,7 +21,7 @@ def _policy(
 ) -> PolicyConfig:
     return PolicyConfig(
         name=name,
-        mode="spread",
+        mode=PolicyMode.SPREAD,
         weight=weight,
         imbalance_query="ignored",
         threshold=threshold,
@@ -37,7 +38,12 @@ def _vm(uuid: str, host: str, weight: float = 0.1) -> VmProfile:
     )
 
 
-def _services(*, up: list[str], disabled: list[str] = (), down: list[str] = ()):
+def _services(
+    *,
+    up: Sequence[str],
+    disabled: Sequence[str] = (),
+    down: Sequence[str] = (),
+) -> dict[str, ComputeService]:
     out: dict[str, ComputeService] = {}
     for h in up:
         out[h] = ComputeService(

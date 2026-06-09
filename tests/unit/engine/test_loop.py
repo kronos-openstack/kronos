@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,8 +39,22 @@ def _make_compute_service(
     )
 
 
-def _make_policy(**overrides: object) -> PolicyConfig:
-    defaults: dict[str, object] = {
+
+def _as_mock(obj: object) -> MagicMock:
+    """Restore the static type of a mocked engine collaborator.
+
+    The fixture replaces EngineLoop attributes with MagicMocks; reading
+    them back through the EngineLoop annotation hides that from the
+    type checker, so mock-only attributes (return_value, assert_*) look
+    like errors. The isinstance assert narrows the type at runtime and
+    statically.
+    """
+    assert isinstance(obj, MagicMock)
+    return obj
+
+
+def _make_policy(**overrides: Any) -> PolicyConfig:
+    defaults: dict[str, Any] = {
         "name": "test-policy",
         "mode": "spread",
         "weight": 1.0,
@@ -166,8 +181,8 @@ def mock_engine():
         engine._evacuator = evacuator
 
         # Default: one host in the test aggregate, both up + enabled.
-        engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2"]
-        engine._nova.list_compute_services.return_value = [
+        _as_mock(engine._nova).get_hosts_in_aggregate.return_value = ["h1", "h2"]
+        _as_mock(engine._nova).list_compute_services.return_value = [
             _make_compute_service("h1"),
             _make_compute_service("h2"),
         ]
@@ -177,7 +192,7 @@ def mock_engine():
 class TestRunCycle:
     def test_evaluates_aggregates(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy(name="enabled-policy"))
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
 
@@ -186,7 +201,7 @@ class TestRunCycle:
 
     def test_captures_evaluation_errors(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._nova.get_hosts_in_aggregate.side_effect = Exception("boom")
+        _as_mock(mock_engine._nova).get_hosts_in_aggregate.side_effect = Exception("boom")
 
         report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
 
@@ -195,7 +210,7 @@ class TestRunCycle:
 
     def test_cycle_number_increments(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         r1 = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
         r2 = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
@@ -250,14 +265,14 @@ class TestFilterUnavailableVms:
 
     def test_dry_run_flag_propagated(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
         assert report.dry_run is True
 
     def test_multi_aggregate(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         report = mock_engine._run_cycle(
             policies, ["agg-a", "agg-b"], dry_run=True,
@@ -266,7 +281,7 @@ class TestFilterUnavailableVms:
 
     def test_completed_at_after_started_at(self, mock_engine: EngineLoop) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         report = mock_engine._run_cycle(policies, ["test-agg"], dry_run=True)
         assert report.completed_at >= report.started_at
@@ -274,7 +289,7 @@ class TestFilterUnavailableVms:
 
 class TestEvaluateAggregate:
     def test_no_hosts_returns_empty(self, mock_engine: EngineLoop) -> None:
-        mock_engine._nova.get_hosts_in_aggregate.return_value = []
+        _as_mock(mock_engine._nova).get_hosts_in_aggregate.return_value = []
         result = mock_engine._evaluate_aggregate(
             "empty-agg", [_make_policy()], dry_run=True,
             services={"h1": _make_compute_service("h1")},
@@ -283,7 +298,7 @@ class TestEvaluateAggregate:
         assert not result.imbalance_detected
 
     def test_balanced_skips_planner(self, mock_engine: EngineLoop) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
             services={
@@ -293,11 +308,11 @@ class TestEvaluateAggregate:
         )
 
         assert result.migration_plan is None
-        mock_engine._profiler.collect.assert_not_called()
-        mock_engine._planner.plan.assert_not_called()
+        _as_mock(mock_engine._profiler).collect.assert_not_called()
+        _as_mock(mock_engine._planner).plan.assert_not_called()
 
     def test_skipped_policy(self, mock_engine: EngineLoop) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_policy_result(skipped=True)
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result(skipped=True)
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
             services={
@@ -307,12 +322,12 @@ class TestEvaluateAggregate:
         )
 
         assert not result.imbalance_detected
-        mock_engine._profiler.collect.assert_not_called()
+        _as_mock(mock_engine._profiler).collect.assert_not_called()
 
     def test_imbalanced_triggers_planner(self, mock_engine: EngineLoop) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
-        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
-        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._profiler).collect.return_value = {"v1": MagicMock()}
+        _as_mock(mock_engine._planner).plan.return_value = MigrationPlan(aggregate="test-agg")
 
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
@@ -322,15 +337,15 @@ class TestEvaluateAggregate:
             },
         )
 
-        mock_engine._profiler.collect.assert_called_once()
-        mock_engine._planner.plan.assert_called_once()
+        _as_mock(mock_engine._profiler).collect.assert_called_once()
+        _as_mock(mock_engine._planner).plan.assert_called_once()
         assert result.migration_plan is not None
         assert result.imbalance_detected
 
     def test_drops_hosts_outside_configured_az(
         self, mock_engine: EngineLoop,
     ) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
             services={
@@ -339,16 +354,16 @@ class TestEvaluateAggregate:
             },
         )
         assert result.aggregate == "test-agg"
-        mock_engine._profiler.collect.assert_not_called()
-        mock_engine._planner.plan.assert_not_called()
+        _as_mock(mock_engine._profiler).collect.assert_not_called()
+        _as_mock(mock_engine._planner).plan.assert_not_called()
 
     def test_keeps_hosts_in_configured_az(
         self, mock_engine: EngineLoop,
     ) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
-        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
-        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
-        mock_engine._nova.get_hosts_in_aggregate.return_value = ["h1", "h2", "h3"]
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._profiler).collect.return_value = {"v1": MagicMock()}
+        _as_mock(mock_engine._planner).plan.return_value = MigrationPlan(aggregate="test-agg")
+        _as_mock(mock_engine._nova).get_hosts_in_aggregate.return_value = ["h1", "h2", "h3"]
 
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
@@ -359,13 +374,13 @@ class TestEvaluateAggregate:
             },
         )
 
-        called_hosts = mock_engine._scorer.evaluate.call_args_list[0].args[1]
+        called_hosts = _as_mock(mock_engine._scorer).evaluate.call_args_list[0].args[1]
         assert called_hosts == ["h1", "h3"]
         assert result.imbalance_detected
 
     def test_no_vm_profiles_skips_planner(self, mock_engine: EngineLoop) -> None:
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
-        mock_engine._profiler.collect.return_value = {}
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._profiler).collect.return_value = {}
 
         result = mock_engine._evaluate_aggregate(
             "test-agg", [_make_policy()], dry_run=True,
@@ -375,7 +390,7 @@ class TestEvaluateAggregate:
             },
         )
 
-        mock_engine._planner.plan.assert_not_called()
+        _as_mock(mock_engine._planner).plan.assert_not_called()
         assert result.migration_plan is None
 
 
@@ -481,7 +496,7 @@ class TestStartLoop:
         policies = _make_policies_config(_make_policy())
 
         with patch("kronos.engine.loop.load_policies", return_value=policies):
-            mock_engine._scorer.evaluate.return_value = _make_policy_result()
+            _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
             def stop_after_wait(*_a: object, **_kw: object) -> bool:
                 mock_engine._running = False
@@ -503,7 +518,7 @@ class TestStartLoop:
         policies = _make_policies_config(_make_policy())
 
         with patch("kronos.engine.loop.load_policies", return_value=policies):
-            mock_engine._scorer.evaluate.return_value = _make_policy_result()
+            _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
             def fire_signal(*_a: object, **_kw: object) -> bool:
                 mock_engine._handle_signal(_signal.SIGTERM, None)
@@ -523,7 +538,7 @@ class TestRunOnce:
         self, mock_engine: EngineLoop,
     ) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         with patch(
             "kronos.engine.loop.load_policies", return_value=policies,
@@ -539,7 +554,7 @@ class TestRunOnce:
         self, mock_engine: EngineLoop,
     ) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         # If override is honoured, _resolve_aggregates should not be
         # consulted - sentinel via patched conf list.
@@ -557,7 +572,7 @@ class TestRunOnce:
         self, mock_engine: EngineLoop,
     ) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         # run_once must not touch the loop machinery; _running stays
         # at its default False and the wakeup event is untouched.
@@ -573,7 +588,7 @@ class TestRunOnce:
         self, mock_engine: EngineLoop,
     ) -> None:
         policies = _make_policies_config(_make_policy())
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         r1 = mock_engine.run_once(policies=policies)
         r2 = mock_engine.run_once(policies=policies)
@@ -663,9 +678,9 @@ class TestTimingsAccumulation:
         timings: dict[str, float] = {}
         mock_engine.timings = timings
 
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
-        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
-        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._profiler).collect.return_value = {"v1": MagicMock()}
+        _as_mock(mock_engine._planner).plan.return_value = MigrationPlan(aggregate="test-agg")
 
         mock_engine._evaluate_aggregate(
             "test-agg",
@@ -688,9 +703,9 @@ class TestTimingsAccumulation:
         self, mock_engine: EngineLoop,
     ) -> None:
         assert mock_engine.timings is None
-        mock_engine._scorer.evaluate.return_value = _make_imbalanced_result()
-        mock_engine._profiler.collect.return_value = {"v1": MagicMock()}
-        mock_engine._planner.plan.return_value = MigrationPlan(aggregate="test-agg")
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_imbalanced_result()
+        _as_mock(mock_engine._profiler).collect.return_value = {"v1": MagicMock()}
+        _as_mock(mock_engine._planner).plan.return_value = MigrationPlan(aggregate="test-agg")
 
         mock_engine._evaluate_aggregate(
             "test-agg",
@@ -708,7 +723,7 @@ class TestTimingsAccumulation:
     ) -> None:
         timings: dict[str, float] = {}
         mock_engine.timings = timings
-        mock_engine._scorer.evaluate.return_value = _make_policy_result()
+        _as_mock(mock_engine._scorer).evaluate.return_value = _make_policy_result()
 
         policies = _make_policies_config(_make_policy())
         mock_engine.run_once(policies=policies)

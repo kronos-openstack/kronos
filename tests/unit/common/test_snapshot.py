@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,8 +16,8 @@ from kronos.common.snapshot import SNAPSHOT_SUBDIR_PREFIX, write_snapshot
 from kronos.policies.models import PoliciesConfig, PolicyConfig
 
 
-def _make_policy(**overrides: object) -> PolicyConfig:
-    defaults: dict[str, object] = {
+def _make_policy(**overrides: Any) -> PolicyConfig:
+    defaults: dict[str, Any] = {
         "name": "p1",
         "mode": "spread",
         "weight": 1.0,
