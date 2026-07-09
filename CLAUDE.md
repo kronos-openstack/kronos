@@ -217,7 +217,7 @@ at load time because the query has to run against live Prometheus.
 **Adding a new policy field:**
 1. Add to `PolicyConfig` in `models.py` with `Field(...)`
 2. Add cross-field validation via `@model_validator` if needed
-3. Update the sample `policies.yaml` in `internal-documentation/`
+3. Update the sample `etc/kronos/policies.yaml.sample`
 4. Add tests in `tests/unit/policies/test_models.py`
 5. Update this section
 

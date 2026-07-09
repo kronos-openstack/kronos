@@ -66,8 +66,8 @@ def generate(
 
     The snapshot ships two synthetic policies - ``cpu-spread`` and
     ``memory-spread`` - matching the shape of the sample
-    ``policies.yaml`` in ``internal-documentation/``.  Benchmark
-    against that file.
+    ``etc/kronos/policies.yaml.sample``.  Benchmark against the
+    ``policies.yaml`` written into the snapshot.
     """
     if out_dir.exists():
         raise SystemExit(f"Output directory already exists: {out_dir}")

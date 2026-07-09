@@ -67,6 +67,26 @@ jobs:
       - run: pip install -e ".[docs]"
       - run: sphinx-build -W -b html docs docs/_build/html
 
+  dco:
+    # Every commit must carry a DCO Signed-off-by line (see CONTRIBUTING.md)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Check Signed-off-by on every commit
+        run: |
+          missing=0
+          for sha in $(git rev-list --no-merges \
+              ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}); do
+            if ! git log -1 --format=%B "$sha" | grep -q "^Signed-off-by: "; then
+              echo "::error::commit $sha is missing a Signed-off-by line"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
   genconfig:
     # The generated config reference must be regenerated and committed
     # whenever options change.
