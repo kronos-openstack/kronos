@@ -213,6 +213,11 @@ enforce_placement_claims = true
 # ephemeral root disk is genuinely local.
 enforce_placement_disk = false
 
+# Require destination Placement HW_CPU_* traits to contain all source traits.
+# Missing data blocks moves. Empty source sets warn and pass. Independent of
+# enforce_placement_claims. Nova still checks migrations. (boolean value)
+require_cpu_compatibility = false
+
 [prometheus]
 url = http://prometheus:9090
 
@@ -484,8 +489,7 @@ enforcer, planner) so you can see where cycles are spent.
 
 Planned work:
 
-- **Richer constraints** - NUMA topology, CPU feature flags, and
-  flavor extra specs as additional move filters.
+- **Richer constraints** - NUMA topology, and flavor extra specs as additional move filters.
 
 Suggestions and contributions are welcome - open an issue.
 
