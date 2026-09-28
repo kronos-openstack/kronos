@@ -15,6 +15,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 from kronos.clients.nova import NovaClient
+from kronos.clients.placement import PlacementClient
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.config import register_opts
 from kronos.common.snapshot import write_snapshot
@@ -72,8 +73,12 @@ def main() -> int:
 
     nova = NovaClient(CONF)
     prometheus = PrometheusClient(CONF)
+    placement = (
+        PlacementClient(CONF) if CONF.engine.require_cpu_compatibility else None
+    )
     target = write_snapshot(
         parent_dir, nova, prometheus, policies, aggregate_names,
+        placement=placement,
     )
 
     LOG.info("Snapshot written to %s", target)

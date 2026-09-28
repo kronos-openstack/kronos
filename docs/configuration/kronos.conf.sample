@@ -185,6 +185,7 @@
 
 
 [engine]
+require_cpu_compatibility = false
 
 #
 # From kronos

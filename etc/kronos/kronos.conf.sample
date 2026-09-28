@@ -2,6 +2,7 @@
 # debug = false
 
 [engine]
+require_cpu_compatibility = false
 # Seconds between policy evaluation cycles.
 # evaluation_interval = 60
 

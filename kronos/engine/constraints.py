@@ -104,13 +104,17 @@ class ConstraintChecker:
 
     Future:
       - NUMA topology
-      - CPU feature flags
       - Flavor extra specs / traits
       - Promote soft rules to planner-side penalties instead of vetoes
     """
 
-    def __init__(self, nova: NovaClient) -> None:
+    def __init__(
+        self, nova: NovaClient, *, require_cpu_compatibility: bool = False,
+    ) -> None:
         self._nova = nova
+        self._require_cpu_compatibility = require_cpu_compatibility
+        self._cpu_traits: dict[str, frozenset[str]] = {}
+        self._cpu_compatibility: dict[tuple[str, str], bool] = {}
         # Lazy-loaded cache; populated on first check() in a cycle.
         self._groups: list[ServerGroup] | None = None
         # Per-cycle nova-compute service map (host -> ComputeService).
@@ -207,6 +211,9 @@ class ConstraintChecker:
                 vm.instance_uuid, dest_host,
             )
         ):
+            return False
+
+        if not self._check_cpu_compatibility(vm.host, dest_host):
             return False
 
         groups = self._get_groups()
@@ -382,5 +389,42 @@ class ConstraintChecker:
         """
         self._groups = None
         self._services = None
+        self._cpu_traits = {}
+        self._cpu_compatibility.clear()
         if self._placement_gate is not None:
             self._placement_gate.invalidate()
+
+    def set_cpu_traits(self, traits: dict[str, frozenset[str]]) -> None:
+        self._cpu_traits = dict(traits)
+        self._cpu_compatibility.clear()
+        for host, features in traits.items():
+            if not features:
+                LOG.warning(
+                    "Host %s reports no HW_CPU_* traits. CPU compatibility "
+                    "checking is blind for moves from this host.", host,
+                )
+
+    def _check_cpu_compatibility(self, source: str, destination: str) -> bool:
+        if not self._require_cpu_compatibility:
+            return True
+        pair = (source, destination)
+        if pair in self._cpu_compatibility:
+            return self._cpu_compatibility[pair]
+        source_traits = self._cpu_traits.get(source)
+        destination_traits = self._cpu_traits.get(destination)
+        if source_traits is None or destination_traits is None:
+            compatible = False
+            LOG.debug(
+                "CPU compatibility: %s -> %s rejected (missing host traits).",
+                source, destination,
+            )
+        else:
+            missing = source_traits - destination_traits
+            compatible = not missing
+            if missing:
+                LOG.debug(
+                    "CPU compatibility: %s -> %s rejected (missing traits: %s).",
+                    source, destination, ", ".join(sorted(missing)),
+                )
+        self._cpu_compatibility[pair] = compatible
+        return compatible

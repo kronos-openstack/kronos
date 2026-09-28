@@ -83,7 +83,10 @@ class EngineLoop:
         self._nova = nova if nova is not None else NovaClient(conf)
         self._scorer = PolicyScorer(self._prometheus)
         self._profiler = VmProfiler(self._prometheus, self._nova)
-        self._constraints = ConstraintChecker(self._nova)
+        self._cpu_compatibility_enabled = bool(conf.engine.require_cpu_compatibility)
+        self._constraints = ConstraintChecker(
+            self._nova, require_cpu_compatibility=self._cpu_compatibility_enabled,
+        )
         # Pluggable placement claims gate.  When enabled, every
         # candidate destination is intersected with the placement
         # headroom (cpu/ram/disk allocation ratios applied) before
@@ -94,7 +97,9 @@ class EngineLoop:
         # affinity enforcer.
         self._placement_enabled = bool(conf.engine.enforce_placement_claims)
         self._placement: PlacementClient | None = placement
-        if self._placement_enabled and self._placement is None:
+        if (
+            self._placement_enabled or self._cpu_compatibility_enabled
+        ) and self._placement is None:
             self._placement = PlacementClient(conf)
         self._placement_gate = PlacementGate(
             enabled=self._placement_enabled,
@@ -470,11 +475,20 @@ class EngineLoop:
         )
 
         enabled_policies = [p for p in policies.policies if p.enabled]
+        scoped_hosts = None
+        if self._cpu_compatibility_enabled:
+            scoped_hosts = self._resolve_cpu_scope(aggregates, services, report)
+            self._constraints.set_cpu_traits(self._fetch_cpu_traits({
+                host for hosts in scoped_hosts.values() for host in hosts
+            }))
 
         for aggregate in aggregates:
+            if scoped_hosts is not None and aggregate not in scoped_hosts:
+                continue
             try:
                 result = self._evaluate_aggregate(
                     aggregate, enabled_policies, dry_run, services,
+                    hosts=scoped_hosts.get(aggregate) if scoped_hosts is not None else None,
                 )
                 report.aggregate_results.append(result)
             except Exception as exc:
@@ -531,10 +545,12 @@ class EngineLoop:
         policies: list[PolicyConfig],
         dry_run: bool,
         services: dict[str, ComputeService],
+        hosts: list[str] | None = None,
     ) -> AggregateResult:
         """Run all policies against one aggregate and plan migrations."""
         name = aggregate if aggregate is not None else "<unassigned>"
-        hosts = self._nova.get_hosts_in_aggregate(aggregate)
+        if hosts is None:
+            hosts = self._nova.get_hosts_in_aggregate(aggregate)
 
         result = AggregateResult(aggregate=name)
 
@@ -911,6 +927,7 @@ class EngineLoop:
                 self._prometheus,
                 policies,
                 aggregates,
+                placement=self._placement if self._cpu_compatibility_enabled else None,
             )
             LOG.info("Engine snapshot written to %s", target)
         except Exception:
@@ -919,3 +936,35 @@ class EngineLoop:
                 configured,
                 exc_info=True,
             )
+
+    def _fetch_cpu_traits(self, hosts: set[str]) -> dict[str, frozenset[str]]:
+        if self._placement is None:
+            return {}
+        try:
+            return self._placement.fetch_cpu_traits(hosts)
+        except Exception:
+            LOG.warning(
+                "Failed to fetch CPU traits. CPU compatibility gate will "
+                "reject every destination this cycle.",
+                exc_info=True,
+            )
+            return {}
+
+    def _resolve_cpu_scope(
+        self,
+        aggregates: list[str | None],
+        services: dict[str, ComputeService],
+        report: CycleReport,
+    ) -> dict[str | None, list[str]]:
+        scoped_hosts: dict[str | None, list[str]] = {}
+        for aggregate in aggregates:
+            name = aggregate if aggregate is not None else "<unassigned>"
+            try:
+                scoped_hosts[aggregate] = self._filter_hosts_to_az(
+                    self._nova.get_hosts_in_aggregate(aggregate), services, name,
+                )
+            except Exception as exc:
+                error_msg = f"Aggregate '{name}': {exc}"
+                LOG.error("Evaluation error: %s", error_msg)
+                report.errors.append(error_msg)
+        return scoped_hosts
