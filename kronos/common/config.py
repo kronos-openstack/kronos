@@ -250,6 +250,15 @@ engine_opts: list[cfg.Opt] = [
             "identical across all hosts in the aggregate."
         ),
     ),
+    cfg.BoolOpt(
+        "require_cpu_compatibility",
+        default=False,
+        help=(
+            "Require destination Placement HW_CPU_* traits to contain all source "
+            "traits. Missing data blocks moves. Empty source sets warn and pass. "
+            "Independent of enforce_placement_claims. Nova still checks migrations."
+        ),
+    ),
 ]
 
 prometheus_opts: list[cfg.Opt] = [

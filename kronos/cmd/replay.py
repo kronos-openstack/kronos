@@ -22,9 +22,10 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 from kronos.clients.nova import ComputeService, Instance
+from kronos.clients.placement import PlacementClient, ProviderSnapshot
 from kronos.clients.prometheus import PrometheusHealth, QueryResult
 from kronos.common.config import register_opts
-from kronos.common.exceptions import AggregateNotFound
+from kronos.common.exceptions import AggregateNotFound, PlacementClientError
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
 from kronos.engine.cooldown import CooldownTracker
 from kronos.engine.loop import EngineLoop
@@ -295,6 +296,7 @@ def main() -> int:
         prometheus=prometheus,  # type: ignore[arg-type]
         cooldown=cooldown,
         timings=timings,
+        placement=ReplayPlacementClient(snapshot_dir),
     )
 
     started = time.perf_counter()
@@ -307,3 +309,32 @@ def main() -> int:
         _log_timings(timings, total)
 
     return 0
+
+
+class ReplayPlacementClient(PlacementClient):
+    def __init__(self, snapshot_dir: Path) -> None:
+        self._traits_path = snapshot_dir / "placement" / "cpu_traits.json"
+
+    def fetch_cpu_traits(self, hosts: set[str]) -> dict[str, frozenset[str]]:
+        if not self._traits_path.exists():
+            raise PlacementClientError(reason="Snapshot has no CPU traits")
+        raw = json.loads(self._traits_path.read_text())
+        if not isinstance(raw, dict):
+            raise PlacementClientError(reason="Invalid CPU traits snapshot")
+        traits: dict[str, frozenset[str]] = {}
+        for host, flags in raw.items():
+            if not isinstance(flags, list) or not all(
+                isinstance(flag, str) for flag in flags
+            ):
+                raise PlacementClientError(reason=f"Invalid CPU traits for {host}")
+            if host in hosts:
+                traits[host] = frozenset(
+                    flag for flag in flags if flag.startswith("HW_CPU_")
+                )
+        return traits
+
+    def fetch_snapshots(self) -> dict[str, ProviderSnapshot]:
+        raise PlacementClientError(
+            reason="Placement claims are not recorded. Disable "
+                   "enforce_placement_claims for offline CPU compatibility replay.",
+        )

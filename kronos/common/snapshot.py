@@ -27,6 +27,7 @@ from pathlib import Path
 from oslo_log import log as logging
 
 from kronos.clients.nova import NovaClient
+from kronos.clients.placement import PlacementClient
 from kronos.clients.prometheus import PrometheusClient
 from kronos.common.messaging import UNASSIGNED_TOPIC_MARKER
 from kronos.policies.models import PoliciesConfig
@@ -43,6 +44,8 @@ def write_snapshot(
     prometheus: PrometheusClient,
     policies: PoliciesConfig,
     aggregate_names: list[str | None],
+    *,
+    placement: PlacementClient | None = None,
 ) -> Path:
     """Write a complete snapshot under ``parent_dir`` and return its path.
 
@@ -77,7 +80,9 @@ def write_snapshot(
         ),
     )
 
-    _write_nova(nova, aggregate_names, target)
+    hosts = _write_nova(nova, aggregate_names, target)
+    if placement is not None:
+        _write_cpu_traits(placement, hosts, target)
     _write_prometheus(prometheus, policies, target)
 
     (target / "cooldowns.json").write_text(
@@ -98,7 +103,7 @@ def _write_nova(
     nova: NovaClient,
     aggregate_names: list[str | None],
     output_dir: Path,
-) -> None:
+) -> set[str]:
     nova_dir = output_dir / "nova"
     nova_dir.mkdir()
 
@@ -162,6 +167,8 @@ def _write_nova(
     except Exception:
         LOG.error("Failed to list compute services", exc_info=True)
         (nova_dir / "services.json").write_text("[]")
+
+    return all_hosts
 
 
 def _write_prometheus(
@@ -234,3 +241,18 @@ def _write_prometheus(
                     policy.name,
                     exc_info=True,
                 )
+
+
+def _write_cpu_traits(
+    placement: PlacementClient, hosts: set[str], output_dir: Path,
+) -> None:
+    directory = output_dir / "placement"
+    directory.mkdir()
+    try:
+        traits = placement.fetch_cpu_traits(hosts)
+    except Exception:
+        LOG.error("Failed to record CPU traits", exc_info=True)
+        traits = {}
+    (directory / "cpu_traits.json").write_text(
+        json.dumps({host: sorted(flags) for host, flags in traits.items()}, indent=2),
+    )

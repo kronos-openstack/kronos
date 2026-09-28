@@ -454,7 +454,7 @@ of the three may veto a candidate destination.
 
 The cache is invalidated each engine cycle.
 
-Future: NUMA, CPU feature flags, flavor extra specs, soft-rule
+Future: NUMA, flavor extra specs, soft-rule
 penalties in the planner -
 https://docs.openstack.org/nova/latest/user/server-groups.html
 
@@ -798,3 +798,28 @@ Engine notification listener updates cooldown/quarantine state
 4. Hard timeout on migration polling
 5. Post-flight verification (host + status)
 6. Idempotent: pre-flight catches duplicate or stale tasks
+
+
+## CPU compatibility gate
+
+`[engine] require_cpu_compatibility` defaults to false and is independent
+of the Placement claims gate. `PlacementClient.fetch_cpu_traits(hosts)`
+reads `HW_CPU_*` traits using Placement microversion 1.6. The engine
+resolves aggregate/AZ scope before fetching the union once per cycle.
+
+`ConstraintChecker` requires source traits to be a subset of destination
+traits after availability and claims checks, before server-group checks.
+All four movers inherit the check. Pair verdicts and trait data reset
+each cycle. Missing data fails closed. A known empty source set warns
+and passes when the destination also has known data.
+
+Both snapshot entry points capture `placement/cpu_traits.json` when
+enabled. `ReplayPlacementClient` reads it without network access.
+Missing or invalid snapshots fail closed. Claims remain unrecorded,
+so CPU replay requires `enforce_placement_claims = false`.
+
+The host-level rule is approximate. `HW_CPU_*` includes hyperthreading
+as well as mapped instruction flags. Current host configuration can
+differ from a running guest's retained CPU model. Nova remains the
+authoritative migration compatibility check. See the configuration
+reference for behavior and limitations.

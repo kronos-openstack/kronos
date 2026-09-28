@@ -206,3 +206,29 @@ class PlacementClient:
             for rc, used in raw.items()
             if rc in TRACKED_RESOURCE_CLASSES
         }
+
+    def fetch_cpu_traits(self, hosts: set[str]) -> dict[str, frozenset[str]]:
+        if not hosts:
+            return {}
+        try:
+            traits: dict[str, frozenset[str]] = {}
+            for rp in self._placement.resource_providers():
+                if rp.name not in hosts:
+                    continue
+                response = self._placement.get(
+                    f"/resource_providers/{rp.id}/traits", microversion="1.6",
+                )
+                response.raise_for_status()
+                raw = response.json()["traits"]
+                if not isinstance(raw, list) or not all(
+                    isinstance(trait, str) for trait in raw
+                ):
+                    raise ValueError(f"Invalid CPU traits response for {rp.name}")
+                traits[rp.name] = frozenset(
+                    trait for trait in raw if trait.startswith("HW_CPU_")
+                )
+            return traits
+        except Exception as exc:
+            raise PlacementClientError(
+                reason=f"Failed to fetch CPU traits: {exc}",
+            ) from exc
