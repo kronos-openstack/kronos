@@ -185,7 +185,6 @@
 
 
 [engine]
-require_cpu_compatibility = false
 
 #
 # From kronos
@@ -293,6 +292,11 @@ require_cpu_compatibility = false
 # aggregate. (boolean value)
 #enforce_placement_disk = false
 
+# Require destination Placement HW_CPU_* traits to contain all source traits.
+# Missing data blocks moves. Empty source sets warn and pass. Independent of
+# enforce_placement_claims. Nova still checks migrations. (boolean value)
+#require_cpu_compatibility = false
+
 
 [executor]
 
@@ -387,6 +391,21 @@ require_cpu_compatibility = false
 
 # Log requests to multiple loggers. (boolean value)
 #split_loggers = false
+
+# An OpenSSL cipher string to set the allowed ciphers for TLS connections. If
+# not specified, the default ciphers from the underlying OpenSSL library are
+# used. (string value)
+#tls_ciphers = <None>
+
+# The minimum TLS version to require for TLS connections. When not specified,
+# the behavior is undefined and defers to the system cryptographic policy.
+# (string value)
+# Possible values:
+# <None> - None - the absence of a setting, defers to the system cryptographic
+# policy
+# 1.2 - TLS 1.2 - enforce minimum TLS version 1.2
+# 1.3 - TLS 1.3 - enforce minimum TLS version 1.3
+#tls_min_version = <None>
 
 # The default service_type for endpoint URL discovery. (string value)
 #service_type = <None>
@@ -585,8 +604,7 @@ require_cpu_compatibility = false
 # (boolean value)
 # This option is deprecated for removal.
 # Its value may be silently ignored in the future.
-# Reason: Hostname verification should remain enabled once operators have
-# completed the migration.
+# Reason: Verification is always enabled now
 #ssl_enforce_hostname_verification = true
 
 # DEPRECATED: Global toggle for enforcing the OpenSSL FIPS mode. This feature
