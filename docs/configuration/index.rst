@@ -31,6 +31,33 @@ and regenerated with:
 .. literalinclude:: kronos.conf.sample
    :language: ini
 
+Messaging
+---------
+
+Kronos shares the OpenStack RabbitMQ broker. Kolla-Ansible configures the
+OpenStack services with quorum queues, set the same for Kronos:
+
+.. code-block:: ini
+
+   [oslo_messaging_rabbit]
+   rabbit_quorum_queue = true
+   rabbit_transient_quorum_queue = true
+
+Without these options oslo.messaging declares non-durable classic queues
+(the RPC topic, server and fanout queues) and a non-durable ``openstack``
+exchange. RabbitMQ 4 deprecates non-durable non-exclusive queues
+(deprecated feature ``transient_nonexcl_queues``). RabbitMQ 4.2 still
+permits them. ``rabbit_stream_fanout`` is not needed: Kronos only casts to
+topics, and the option also requires ``rabbit_qos_prefetch_count`` greater
+than 0.
+
+Switching an existing deployment: RabbitMQ refuses to redeclare an
+existing queue or exchange with a different durability
+(``PRECONDITION_FAILED``). Stop the engines and executors, delete the
+``kronos.*`` queues, delete the ``openstack`` exchange if nothing else is
+bound to it (``rabbitmqctl list_bindings source_name destination_name``),
+then start Kronos with the new options.
+
 Policies file
 -------------
 
@@ -82,9 +109,9 @@ flags or guests retaining an older CPU model after reconfiguration.
 Nova's migration pre-check remains authoritative.
 
 Producer source:
-`Nova libvirt CPU trait reporting <https://github.com/openstack/nova/blob/stable/2025.2/nova/virt/libvirt/driver.py>`_.
+`Nova libvirt CPU trait reporting <https://github.com/openstack/nova/blob/stable/2026.1/nova/virt/libvirt/driver.py>`_.
 API source:
-`Placement provider traits <https://github.com/openstack/placement/blob/stable/2025.2/placement/handlers/trait.py>`_.
+`Placement provider traits <https://github.com/openstack/placement/blob/stable/2026.1/placement/handlers/trait.py>`_.
 
 When the option is enabled, both ``kronos-record`` and engine SIGUSR1
 snapshots write ``placement/cpu_traits.json``, a mapping from host names

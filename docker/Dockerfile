@@ -20,8 +20,8 @@
 #
 #   python -m build
 #   docker build -f docker/Dockerfile \
-#     --build-arg BASE_TAG=2025.1-ubuntu-noble \
-#     -t kronos:2025.1-ubuntu-noble .
+#     --build-arg BASE_TAG=2026.1-ubuntu-noble \
+#     -t kronos:2026.1-ubuntu-noble .
 #
 # Run (standalone, without kolla-ansible):
 #
@@ -30,10 +30,10 @@
 #     -v /etc/kronos/kronos-engine.json:/var/lib/kolla/config_files/config.json:ro \
 #     -v /etc/kronos/kronos.conf:/var/lib/kolla/config_files/kronos.conf:ro \
 #     -v /etc/kronos/policies.yaml:/var/lib/kolla/config_files/policies.yaml:ro \
-#     kronos:2025.1-ubuntu-noble
+#     kronos:2026.1-ubuntu-noble
 
 ARG BASE_IMAGE=quay.io/openstack.kolla/openstack-base
-ARG BASE_TAG=2025.1-ubuntu-noble
+ARG BASE_TAG=2026.1-ubuntu-noble
 FROM ${BASE_IMAGE}:${BASE_TAG}
 
 LABEL maintainer="Kronos maintainers" name="kronos"

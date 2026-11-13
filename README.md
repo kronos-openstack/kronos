@@ -238,6 +238,10 @@ username = guest
 password = guest
 virtual_host = /
 
+[oslo_messaging_rabbit]
+rabbit_quorum_queue = true
+rabbit_transient_quorum_queue = true
+
 [executor]
 max_concurrent_migrations = 2
 migration_timeout = 600
@@ -410,6 +414,12 @@ serviced by an independent unit on its own threads):
 | `kronos.results.<aggregate>` | Notification | Executor | Engine (drives cooldown and quarantine state) |
 
 The unassigned-hosts pool uses the reserved name `_unassigned_` in its topics.
+
+Use quorum queues (`[oslo_messaging_rabbit] rabbit_quorum_queue` and
+`rabbit_transient_quorum_queue`), as Kolla-Ansible does for the OpenStack
+services. Without them oslo.messaging declares non-durable classic queues,
+a deprecated feature in RabbitMQ 4 (`transient_nonexcl_queues`). See the
+configuration reference for switching an existing deployment.
 
 ## Project Layout
 
