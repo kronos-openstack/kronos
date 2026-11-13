@@ -459,13 +459,13 @@
 #status_code_retry_delay = <None>
 
 # List of retriable HTTP status codes that should be retried. If not set
-# default to  [503] (list value)
+# default to `[503]` (list value)
 #retriable_status_codes = <None>
 
 # DEPRECATED: The default interface for endpoint URL discovery. (string value)
 # This option is deprecated for removal.
 # Its value may be silently ignored in the future.
-# Reason: Using valid-interfaces is preferrable because it is capable of
+# Reason: Using valid-interfaces is preferable because it is capable of
 # accepting a list of possible interfaces.
 #interface = <None>
 

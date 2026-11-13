@@ -19,8 +19,8 @@ daemons: the ``command`` in ``config.json`` selects which one starts.
 
    python -m build
    docker build -f docker/Dockerfile \
-     --build-arg BASE_TAG=2025.1-ubuntu-noble \
-     -t kronos:2025.1-ubuntu-noble .
+     --build-arg BASE_TAG=2026.1-ubuntu-noble \
+     -t kronos:2026.1-ubuntu-noble .
 
 ``BASE_TAG`` selects the OpenStack release and distro of the base
 image; use the same release your cloud runs.
@@ -50,7 +50,7 @@ Standalone run
      -v /etc/kronos/kronos-engine.json:/var/lib/kolla/config_files/config.json:ro \
      -v /etc/kronos/kronos.conf:/var/lib/kolla/config_files/kronos.conf:ro \
      -v /etc/kronos/policies.yaml:/var/lib/kolla/config_files/policies.yaml:ro \
-     kronos:2025.1-ubuntu-noble
+     kronos:2026.1-ubuntu-noble
 
 The executor is the same image with the executor ``config.json``
 (its ``command`` carries the ``--aggregate`` flags).
