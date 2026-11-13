@@ -307,12 +307,11 @@ def _detect_violations(
                 out.append(
                     _Violation(group=group, offending_uuids=frozenset(offenders)),
                 )
-        elif group.policy in AFFINITY_POLICIES:
+        elif group.policy in AFFINITY_POLICIES and len(hosts_used) > 1:
             # Violation when members span more than one host.
-            if len(hosts_used) > 1:
-                out.append(
-                    _Violation(group=group, offending_uuids=frozenset(visible)),
-                )
+            out.append(
+                _Violation(group=group, offending_uuids=frozenset(visible)),
+            )
     return out
 
 
